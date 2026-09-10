@@ -89,6 +89,10 @@ func main() {
 		err = cmdSSH(args)
 	case "forward":
 		err = cmdForward(args)
+	case "unforward":
+		err = cmdUnforward(args)
+	case "forwards":
+		err = cmdForwards(args)
 	case "devices":
 		err = cmdDevices(args)
 	case "list":
@@ -131,6 +135,9 @@ func usage() {
   pmc unserve ssh             stop serving sshd
   pmc ssh [user@]<name> [-- cmd]  SSH into a paired device (names, not tokens)
   pmc forward <name>:<port> [local]  localhost forward for plain-TCP tools
+  pmc forward <name>:<port> --persist  keep it via daemon (see pmc forwards)
+  pmc unforward <name:port|local>      drop a persistent forward
+  pmc forwards                    show persistent forwards + live state
   pmc devices                 paired devices + presence
   pmc list                    this device's exposes
   pmc status                  tunnel + daemon health
@@ -461,11 +468,12 @@ func cmdSSH(args []string) error {
 	if err := trustCheck(cfg, peer); err != nil {
 		return err
 	}
-	dialer, err := newPeerDialer(cfg, peer)
+	tun, err := newPeerTunnel(cfg)
 	if err != nil {
 		return err
 	}
-	defer dialer.close()
+	dialer := newPeerDialer(tun, cfg, peer)
+	defer dialer.tun.Close()
 	// Local forward → peer:22, then stock ssh with per-name host alias.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -513,7 +521,9 @@ func sshTarget(login string) string {
 
 // peerDialer dials one peer's TCP ports through the mesh: directory lookup
 // once, TOFU check once, then per-connection dials with one refresh-and-
-// retry on stale addresses (peer re-paired, daemon restarted).
+// retry on stale addresses (peer re-paired, daemon restarted). The tunnel
+// is caller-owned (shared daemon tunnel or per-command one); close is the
+// tunnel owner's job, not the dialer's.
 type peerDialer struct {
 	tun  *bridge.Tunnel
 	ctx  context.Context
@@ -523,23 +533,25 @@ type peerDialer struct {
 	cur  peerInfo
 }
 
-func newPeerDialer(cfg config.PMCConfig, peer peerInfo) (*peerDialer, error) {
-	tun := bridge.New(nil)
-	ck, err := clientKey(cfg)
-	if err != nil {
-		return nil, err
-	}
-	tun.WithClientKey(ck)
-	tun.WithDERPMapURL(apiBase(cfg) + "/_pms/derpmap.json")
+func newPeerDialer(tun *bridge.Tunnel, cfg config.PMCConfig, peer peerInfo) *peerDialer {
 	return &peerDialer{
 		tun: tun,
 		ctx: context.Background(),
 		cfg: cfg, name: peer.Name, cur: peer,
-	}, nil
+	}
 }
 
-func (d *peerDialer) close() {
-	d.tun.Close()
+// newPeerTunnel builds a keyed tunnel for dialing out (client role).
+func newPeerTunnel(cfg config.PMCConfig) (*bridge.Tunnel, error) {
+	tun := bridge.New(nil)
+	ck, err := clientKey(cfg)
+	if err != nil {
+		tun.Close()
+		return nil, err
+	}
+	tun.WithClientKey(ck)
+	tun.WithDERPMapURL(apiBase(cfg) + "/_pms/derpmap.json")
+	return tun, nil
 }
 
 func (d *peerDialer) refresh() {
@@ -585,25 +597,66 @@ func parseForwardTarget(s string) (name string, port uint16, err error) {
 	return s[:i], uint16(n), nil
 }
 
+// pickLocalPort binds 127.0.0.1:want, or the next free port above it,
+// and reports loudly which one won. Loopback has no names, so stable,
+// announced ports are the entire UX. Privileged ports (<1024) need root:
+// non-root callers skip straight past them instead of burning the scan
+// budget one EACCES at a time.
+func pickLocalPort(want int) (int, error) {
+	try := func(p int) (int, bool) {
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
+		if err != nil {
+			return 0, false
+		}
+		ln.Close()
+		return p, true
+	}
+	if p, ok := try(want); ok {
+		return p, nil // exact wish (works as root, or free)
+	}
+	start := want + 1
+	if start < 1024 {
+		start = 1024
+	}
+	for p := start; p <= 65535 && p-start <= 1000; p++ {
+		if q, ok := try(p); ok {
+			return q, nil
+		}
+	}
+	return 0, fmt.Errorf("no free loopback port near %d", want)
+}
+
 // cmdForward exposes a peer's TCP port on local loopback for tools that
 // speak plain SSH/TCP but not the mesh: VS Code Remote, Ansible, Termius,
-// database GUIs, rsync, scp. Runs until Ctrl-C.
+// database GUIs, rsync, scp. Foreground runs until Ctrl-C; --persist hands
+// the mapping to the daemon instead (survives restarts, see pmc forwards).
 func cmdForward(args []string) error {
-	args = hoist(args, "config")
+	// --persist is boolean: strip it before hoist (which assumes
+	// --flag value pairs and would swallow the next positional).
+	var persist bool
+	kept := args[:0]
+	for _, a := range args {
+		if a == "--persist" {
+			persist = true
+			continue
+		}
+		kept = append(kept, a)
+	}
+	args = hoist(kept, "config")
 	fs := flag.NewFlagSet("forward", flag.ExitOnError)
 	cp := cfgPath(fs)
 	_ = fs.Parse(args)
 	if fs.NArg() < 1 || fs.NArg() > 2 {
-		return fmt.Errorf("usage: pmc forward <name>:<port> [local-port]")
+		return fmt.Errorf("usage: pmc forward <name>:<port> [local-port] [--persist]")
 	}
 	name, port, err := parseForwardTarget(fs.Arg(0))
 	if err != nil {
 		return err
 	}
-	local := int(port)
+	want := int(port)
 	if fs.NArg() == 2 {
-		local, err = strconv.Atoi(fs.Arg(1))
-		if err != nil || local <= 0 || local > 65535 {
+		want, err = strconv.Atoi(fs.Arg(1))
+		if err != nil || want <= 0 || want > 65535 {
 			return fmt.Errorf("bad local port %q", fs.Arg(1))
 		}
 	}
@@ -618,14 +671,37 @@ func cmdForward(args []string) error {
 	if err := trustCheck(cfg, peer); err != nil {
 		return err
 	}
-	dialer, err := newPeerDialer(cfg, peer)
+	local, err := pickLocalPort(want)
 	if err != nil {
 		return err
 	}
-	defer dialer.close()
+	if local != want {
+		fmt.Printf("port %d busy, using %d instead\n", want, local)
+	}
+	if persist {
+		kept := cfg.Forwards[:0]
+		for _, f := range cfg.Forwards {
+			if f.To != fs.Arg(0) {
+				kept = append(kept, f)
+			}
+		}
+		cfg.Forwards = append(kept, config.Forward{To: fs.Arg(0), Local: local})
+		if err := savePMC(*cp, &cfg); err != nil {
+			return err
+		}
+		fmt.Printf("persistent: 127.0.0.1:%d → %s (daemon holds it)\n", local, fs.Arg(0))
+		ensureDaemon(*cp, cfg)
+		return nil
+	}
+	tun, err := newPeerTunnel(cfg)
+	if err != nil {
+		return err
+	}
+	dialer := newPeerDialer(tun, cfg, peer)
+	defer dialer.tun.Close()
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", local))
 	if err != nil {
-		return fmt.Errorf("forward: listen: %w (something already on %d?)", err, local)
+		return fmt.Errorf("forward: listen: %w (taken in the meantime?)", err)
 	}
 	defer ln.Close()
 	fmt.Printf("forwarding 127.0.0.1:%d → %s:%d  (Ctrl-C to stop)\n", local, name, port)
@@ -675,6 +751,79 @@ func validLogin(s string) bool {
 func portOf(addr string) string {
 	_, p, _ := net.SplitHostPort(addr)
 	return p
+}
+
+// fwdState is one daemon-held forward for `pmc forwards` (loopback file,
+// not an API — same machine only).
+type fwdState struct {
+	To    string `json:"to"`
+	Local int    `json:"local"`
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+}
+
+func fwdStatePath(cfg config.PMCConfig) string {
+	return filepath.Join(cfg.DataDir, "forwards.json")
+}
+
+func cmdUnforward(args []string) error {
+	args = hoist(args, "config")
+	fs := flag.NewFlagSet("unforward", flag.ExitOnError)
+	cp := cfgPath(fs)
+	_ = fs.Parse(args)
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: pmc unforward <name:port|local-port>")
+	}
+	cfg := loadPMC(*cp)
+	key := fs.Arg(0)
+	kept := cfg.Forwards[:0]
+	for _, f := range cfg.Forwards {
+		if f.To != key && strconv.Itoa(f.Local) != key {
+			kept = append(kept, f)
+		}
+	}
+	cfg.Forwards = kept
+	if err := savePMC(*cp, &cfg); err != nil {
+		return err
+	}
+	pokeDaemon(cfg)
+	fmt.Printf("removed %q (daemon drops it within half a minute)\n", key)
+	return nil
+}
+
+func cmdForwards(args []string) error {
+	args = hoist(args, "config")
+	fs := flag.NewFlagSet("forwards", flag.ExitOnError)
+	cp := cfgPath(fs)
+	_ = fs.Parse(args)
+	cfg := loadPMC(*cp)
+	if len(cfg.Forwards) == 0 {
+		fmt.Println("no persistent forwards (pmc forward <name>:<port> --persist)")
+		return nil
+	}
+	live := map[string]fwdState{}
+	if b, err := os.ReadFile(fwdStatePath(cfg)); err == nil {
+		var states []fwdState
+		if json.Unmarshal(b, &states) == nil {
+			for _, st := range states {
+				live[st.To] = st
+			}
+		}
+	}
+	for _, f := range cfg.Forwards {
+		st := "starting"
+		if s, ok := live[f.To]; ok {
+			if s.OK {
+				st = "live"
+			} else {
+				st = "error: " + s.Error
+			}
+		} else if !isDaemonUp(cfg) {
+			st = "daemon down"
+		}
+		fmt.Printf("127.0.0.1:%-6d → %-16s %s\n", f.Local, f.To, st)
+	}
+	return nil
 }
 
 // --- devices / list / status ---
@@ -977,6 +1126,8 @@ func runDaemon(cfgPath string) {
 	allow, _ := fetchAllowlist(cfg)
 	allow = cachedAllow(cfg, allow)
 	restartServing(allow)
+	fwd := newFwdSync(ctx, tun, cfgPath)
+	fwd.sync()
 	hb := time.NewTicker(30 * time.Second)
 	allowTick := time.NewTicker(30 * time.Second)
 	defer hb.Stop()
@@ -996,6 +1147,7 @@ func runDaemon(cfgPath string) {
 			allow = cachedAllow(cfg, allow)
 			lastSig = serveSignature(allow, cfg)
 			restartServing(allow)
+			fwd.sync()
 		case <-hb.C:
 			cfg = loadPMC(cfgPath)
 			addr := ""
@@ -1017,7 +1169,147 @@ func runDaemon(cfgPath string) {
 				allow = fresh
 				restartServing(allow)
 			}
+			fwd.sync()
 		}
+	}
+}
+
+// fwdSync holds the daemon's persistent forward listeners (`pmc forward
+// --persist`), mirroring the config with prune + recreate semantics.
+type fwdSync struct {
+	ctx  context.Context
+	tun  *bridge.Tunnel
+	path string // config path (reloaded every sync)
+
+	mu     sync.Mutex
+	cancel map[string]context.CancelFunc // forward.To → stop
+	pins   map[string]string             // forward.To → pinned peer pubkey
+}
+
+func newFwdSync(ctx context.Context, tun *bridge.Tunnel, cfgPath string) *fwdSync {
+	return &fwdSync{
+		ctx: ctx, tun: tun, path: cfgPath,
+		cancel: map[string]context.CancelFunc{},
+		pins:   map[string]string{},
+	}
+}
+
+// pinnedChanged records the peer key on first sight; later mismatch errors.
+func (f *fwdSync) pinnedChanged(to, pubkey string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if prev, ok := f.pins[to]; ok {
+		return prev != pubkey
+	}
+	f.pins[to] = pubkey
+	return false
+}
+
+// ensure runs one forward listener, recreating on failure (dropped key).
+func (f *fwdSync) ensure(to string, local int, peer peerInfo, port uint16) {
+	f.mu.Lock()
+	if _, ok := f.cancel[to]; ok {
+		f.mu.Unlock()
+		return
+	}
+	fctx, cancel := context.WithCancel(f.ctx)
+	f.cancel[to] = cancel
+	f.mu.Unlock()
+	go func() {
+		defer func() {
+			f.mu.Lock()
+			delete(f.cancel, to)
+			f.mu.Unlock()
+		}()
+		// Shared daemon tunnel (keyed at daemon start; node identity is
+		// stable across rebinds, so no per-forward client needed).
+		// Config reloaded fresh: a re-pair mid-run must not dial stale.
+		dialer := newPeerDialer(f.tun, loadPMC(f.path), peer)
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", local))
+		if err != nil {
+			log.Printf("pmc: forward %s: listen: %v", to, err)
+			return
+		}
+		defer ln.Close()
+		go func() {
+			<-fctx.Done()
+			ln.Close()
+		}()
+		for {
+			down, err := ln.Accept()
+			if err != nil {
+				select {
+				case <-fctx.Done():
+					return
+				default:
+					continue
+				}
+			}
+			go func(down net.Conn) {
+				defer down.Close()
+				up, err := dialer.dial(port)
+				if err != nil {
+					return
+				}
+				defer up.Close()
+				tailcat.ProxyConns(down, up)
+			}(down)
+		}
+	}()
+}
+
+// prune stops listeners no longer configured.
+func (f *fwdSync) prune(live map[string]bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for to, cancel := range f.cancel {
+		if !live[to] {
+			cancel()
+			delete(f.cancel, to)
+			delete(f.pins, to)
+		}
+	}
+}
+
+// sync reconciles listeners with the current config and writes
+// forwards.json (read by `pmc forwards`). Directory fetch failures keep
+// last-known listeners; TOFU pins are checked headlessly — a changed peer
+// key errors loudly instead of following it.
+func (f *fwdSync) sync() {
+	cfg := loadPMC(f.path)
+	if cfg.Device == "" {
+		return // unpaired; nothing to hold
+	}
+	devs, _, err := directoryFetch(cfg)
+	if err != nil {
+		return // keep last-known; retry next tick
+	}
+	byName := map[string]peerInfo{}
+	for _, d := range devs {
+		byName[d.Name] = peerInfo{Name: d.Name, PubKey: d.PubKey, FullAddr: d.FullAddr}
+	}
+	live := map[string]bool{}
+	var states []fwdState
+	for _, fw := range cfg.Forwards {
+		live[fw.To] = true
+		st := fwdState{To: fw.To, Local: fw.Local, OK: true}
+		name, port, err := parseForwardTarget(fw.To)
+		peer, ok := byName[name]
+		switch {
+		case err != nil:
+			st.OK, st.Error = false, err.Error()
+		case !ok || peer.FullAddr == "":
+			st.OK, st.Error = false, "peer unknown or offline"
+		case f.pinnedChanged(fw.To, peer.PubKey):
+			st.OK, st.Error = false, "peer identity changed — re-run pmc forward to re-pin"
+		default:
+			f.ensure(fw.To, fw.Local, peer, port)
+		}
+		states = append(states, st)
+	}
+	f.prune(live)
+	if b, err := json.Marshal(states); err == nil {
+		_ = os.WriteFile(fwdStatePath(cfg), b, 0o600)
 	}
 }
 
@@ -1051,6 +1343,8 @@ func apiBase(cfg config.PMCConfig) string { return strings.TrimSuffix(cfg.Server
 
 func directoryFetch(cfg config.PMCConfig) (devs []struct {
 	Name     string    `json:"name"`
+	PubKey   string    `json:"pubkey"`
+	FullAddr string    `json:"full_addr"`
 	Online   bool      `json:"online"`
 	LastSeen time.Time `json:"last_seen"`
 	SSHUsers []string  `json:"ssh_users"`
@@ -1070,6 +1364,8 @@ func directoryFetch(cfg config.PMCConfig) (devs []struct {
 		Revision uint64 `json:"revision"`
 		Devices  []struct {
 			Name     string    `json:"name"`
+			PubKey   string    `json:"pubkey"`
+			FullAddr string    `json:"full_addr"`
 			Online   bool      `json:"online"`
 			LastSeen time.Time `json:"last_seen"`
 			SSHUsers []string  `json:"ssh_users"`

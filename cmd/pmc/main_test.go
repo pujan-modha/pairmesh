@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -117,5 +118,30 @@ func TestParseForwardTarget(t *testing.T) {
 		if _, _, err := parseForwardTarget(bad); err == nil {
 			t.Errorf("%q accepted", bad)
 		}
+	}
+}
+
+func TestPickLocalPort(t *testing.T) {
+	// Occupy a port, then demand it: must skip, not fail or steal.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	want := ln.Addr().(*net.TCPAddr).Port
+	got, err := pickLocalPort(want)
+	if err != nil {
+		t.Fatalf("no free port near taken %d: %v", want, err)
+	}
+	if got == want {
+		t.Fatalf("returned taken port %d", want)
+	}
+	if got <= 1024 {
+		t.Fatalf("returned privileged port %d as non-root-safe choice", got)
+	}
+	// Free port returns itself.
+	ln.Close()
+	if got2, err := pickLocalPort(want); err != nil || got2 != want {
+		t.Fatalf("free port %d → got %d, %v", want, got2, err)
 	}
 }

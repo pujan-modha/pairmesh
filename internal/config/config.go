@@ -43,13 +43,14 @@ func DefaultPMS() PMSConfig {
 
 // PMCConfig is the client configuration.
 type PMCConfig struct {
-	Server   string   `yaml:"server"` // derp host for pairing/control (https)
-	Domain   string   `yaml:"domain"`
-	Device   string   `yaml:"device"` // auto-assigned at pair
-	Token    string   `yaml:"token"`  // device bearer token (file/env only)
-	DataDir  string   `yaml:"data_dir"`
-	Exposes  []Expose `yaml:"exposes"`
-	ServeSSH bool     `yaml:"serve_ssh"`
+	Server   string    `yaml:"server"` // derp host for pairing/control (https)
+	Domain   string    `yaml:"domain"`
+	Device   string    `yaml:"device"` // auto-assigned at pair
+	Token    string    `yaml:"token"`  // device bearer token (file/env only)
+	DataDir  string    `yaml:"data_dir"`
+	Exposes  []Expose  `yaml:"exposes"`
+	Forwards []Forward `yaml:"forwards"`
+	ServeSSH bool      `yaml:"serve_ssh"`
 }
 
 // Expose maps one local service.
@@ -59,6 +60,13 @@ type Expose struct {
 	Host  string `yaml:"host,omitempty"` // full custom hostname → local
 	TCP   int    `yaml:"tcp,omitempty"`  // public TCP port
 	UDP   int    `yaml:"udp,omitempty"`  // public UDP port
+}
+
+// Forward maps a peer's TCP port onto local loopback, held by the daemon.
+// Local is the resolved stable port (auto-picked free at --persist time).
+type Forward struct {
+	To    string `yaml:"to"`    // "<name>:<port>" on the peer
+	Local int    `yaml:"local"` // 127.0.0.1 port locally
 }
 
 // DefaultPMC returns client defaults.
