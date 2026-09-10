@@ -82,3 +82,22 @@ func TestTrustCheckYesPins(t *testing.T) {
 		t.Fatal("changed identity accepted")
 	}
 }
+
+func TestSSHLoginParsing(t *testing.T) {
+	if got := sshTarget(""); got != "127.0.0.1" {
+		t.Fatalf("no login: %q", got)
+	}
+	if got := sshTarget("pujan"); got != "pujan@127.0.0.1" {
+		t.Fatalf("login: %q", got)
+	}
+	for _, ok := range []string{"pujan", "root", "a1", "_svc", "user-name", "u.name"} {
+		if !validLogin(ok) {
+			t.Errorf("validLogin(%q) = false", ok)
+		}
+	}
+	for _, bad := range []string{"", "1abc", "has space", "a/b", "a@b", "x" + string(rune(0))} {
+		if validLogin(bad) {
+			t.Errorf("validLogin(%q) = true", bad)
+		}
+	}
+}

@@ -108,3 +108,37 @@ func TestRepair(t *testing.T) {
 		t.Fatalf("re-pair orphaned entries: %+v", devs)
 	}
 }
+
+// Rotation: fresh tokens are not due; rotated ones work alongside the old
+// inside grace, and alone after it. List never leaks token material.
+func TestRotateToken(t *testing.T) {
+	d := New(t.TempDir() + "/dir.db")
+	name, tok1, err := d.Add("box", "nodekey:aaa", "tc1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.TokenDue(name) {
+		t.Fatal("fresh token due")
+	}
+	tok2, err := d.RotateToken(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok2 == tok1 {
+		t.Fatal("rotation kept the token")
+	}
+	if _, ok := d.AuthToken(name, tok2); !ok {
+		t.Fatal("rotated token rejected")
+	}
+	if _, ok := d.AuthToken(name, tok1); !ok {
+		t.Fatal("old token dead inside grace window")
+	}
+	for _, dev := range d.List() {
+		if len(dev.TokenHash) != 0 || len(dev.PrevTokenHash) != 0 {
+			t.Fatal("List leaks token hashes")
+		}
+	}
+	if _, err := d.RotateToken("nope"); err != ErrNotFound {
+		t.Fatalf("rotate unknown err = %v", err)
+	}
+}

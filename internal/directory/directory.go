@@ -18,14 +18,27 @@ import (
 
 // Device is one paired pmc box.
 type Device struct {
-	Name      string    `json:"name"`
-	PubKey    string    `json:"pubkey"` // nodekey:... (allowlist identity)
-	FullAddr  string    `json:"full_addr,omitempty"`
-	Exposes   []string  `json:"exposes,omitempty"`    // compact specs: web:<as>:<local> tcp:<pub>:<local> udp:<pub>:<local> ssh
-	TokenHash []byte    `json:"token_hash,omitempty"` // sha256(device bearer token)
-	Online    bool      `json:"online"`
-	LastSeen  time.Time `json:"last_seen"`
+	Name      string   `json:"name"`
+	PubKey    string   `json:"pubkey"` // nodekey:... (allowlist identity)
+	FullAddr  string   `json:"full_addr,omitempty"`
+	Exposes   []string `json:"exposes,omitempty"`    // compact specs: web:<as>:<local> tcp:<pub>:<local> udp:<pub>:<local> ssh
+	TokenHash []byte   `json:"token_hash,omitempty"` // sha256(device bearer token)
+	// Previous token during the rotation grace window (crash between
+	// receiving and storing the new one must not lock the device out).
+	PrevTokenHash []byte    `json:"prev_token_hash,omitempty"`
+	PrevExpiry    time.Time `json:"prev_expiry,omitempty"`
+	TokenIssuedAt time.Time `json:"token_issued_at,omitempty"`
+	Online        bool      `json:"online"`
+	LastSeen      time.Time `json:"last_seen"`
 }
+
+// Rotation policy: bearer tokens live TokenTTL, then the next heartbeat
+// swaps them. The old one stays valid for GracePeriod so a client that
+// crashes between receiving and persisting the new token isn't orphaned.
+const (
+	TokenTTL    = time.Hour
+	GracePeriod = 5 * time.Minute
+)
 
 type storeFile struct {
 	Devices []Device `json:"devices"`
@@ -92,6 +105,9 @@ func (d *Directory) Add(stem, pubkey, fullAddr string) (name, token string, err 
 			// the old bearer dies with the old pairing.
 			st.Devices[i].FullAddr = fullAddr
 			st.Devices[i].TokenHash = hashOf(token)
+			st.Devices[i].TokenIssuedAt = time.Now()
+			st.Devices[i].PrevTokenHash = nil
+			st.Devices[i].PrevExpiry = time.Time{}
 			st.Devices[i].Online = true
 			st.Devices[i].LastSeen = time.Now()
 			d.rev++
@@ -121,7 +137,8 @@ func (d *Directory) Add(stem, pubkey, fullAddr string) (name, token string, err 
 	}
 	st.Devices = append(st.Devices, Device{
 		Name: name, PubKey: pubkey, FullAddr: fullAddr,
-		TokenHash: hashOf(token), Online: true, LastSeen: time.Now(),
+		TokenHash: hashOf(token), TokenIssuedAt: time.Now(),
+		Online: true, LastSeen: time.Now(),
 	})
 	d.rev++
 	if err := d.saveLocked(st); err != nil {
@@ -222,9 +239,12 @@ func (d *Directory) Heartbeat(name, fullAddr string, online bool) error {
 	return ErrNotFound
 }
 
-// AuthToken constant-time checks a device bearer token. Returns device on success.
+// AuthToken constant-time checks a device bearer token: current, or the
+// previous one inside its grace window (rotation crash-safety). Returns
+// the device on success. Scrubbed copies only ever leave via List.
 func (d *Directory) AuthToken(name, token string) (Device, bool) {
 	h := hashOf(token)
+	now := time.Now()
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	st, err := d.loadLocked()
@@ -232,12 +252,73 @@ func (d *Directory) AuthToken(name, token string) (Device, bool) {
 		return Device{}, false
 	}
 	for _, dev := range st.Devices {
-		if dev.Name == name && len(dev.TokenHash) == len(h) &&
+		if dev.Name != name {
+			continue
+		}
+		if len(dev.TokenHash) == len(h) &&
 			subtle.ConstantTimeCompare(dev.TokenHash, h) == 1 {
-			return dev, true
+			return scrub(dev), true
+		}
+		if now.Before(dev.PrevExpiry) && len(dev.PrevTokenHash) == len(h) &&
+			subtle.ConstantTimeCompare(dev.PrevTokenHash, h) == 1 {
+			return scrub(dev), true
 		}
 	}
 	return Device{}, false
+}
+
+// RotateToken swaps in a fresh bearer token, keeping the old one valid for
+// GracePeriod. Returns the raw new token (shown once, stored hashed).
+func (d *Directory) RotateToken(name string) (string, error) {
+	token, err := MintToken()
+	if err != nil {
+		return "", err
+	}
+	now := time.Now()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	st, err := d.loadLocked()
+	if err != nil {
+		return "", err
+	}
+	for i, dev := range st.Devices {
+		if dev.Name == name {
+			st.Devices[i].PrevTokenHash = dev.TokenHash
+			st.Devices[i].PrevExpiry = now.Add(GracePeriod)
+			st.Devices[i].TokenHash = hashOf(token)
+			st.Devices[i].TokenIssuedAt = now
+			if err := d.saveLocked(st); err != nil {
+				return "", err
+			}
+			return token, nil
+		}
+	}
+	return "", ErrNotFound
+}
+
+// TokenDue reports whether name's token is older than TokenTTL (rotate on
+// next heartbeat). Unknown devices report false — AuthToken gates anyway.
+func (d *Directory) TokenDue(name string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	st, err := d.loadLocked()
+	if err != nil {
+		return false
+	}
+	for _, dev := range st.Devices {
+		if dev.Name == name {
+			return time.Since(dev.TokenIssuedAt) > TokenTTL
+		}
+	}
+	return false
+}
+
+// scrub removes all token material before a Device crosses a trust
+// boundary (logs, API responses, Status output).
+func scrub(dev Device) Device {
+	dev.TokenHash = nil
+	dev.PrevTokenHash = nil
+	return dev
 }
 
 // List returns all devices (no token hashes — scrubbed for status output).
@@ -259,8 +340,7 @@ func (d *Directory) ListErr() ([]Device, error) {
 	}
 	out := make([]Device, 0, len(st.Devices))
 	for _, dev := range st.Devices {
-		dev.TokenHash = nil
-		out = append(out, dev)
+		out = append(out, scrub(dev))
 	}
 	return out, nil
 }

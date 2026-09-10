@@ -528,6 +528,16 @@ func (s *server) routes() http.Handler {
 		if req.Exposes != nil {
 			_ = s.dir.SetExposes(dev.Name, *req.Exposes)
 		}
+		// Bearer rotation: tokens older than TokenTTL are swapped on the
+		// heartbeat that notices, returned once in-band. The old one stays
+		// valid through GracePeriod (crash between receive and store).
+		// Offline goodbyes never rotate (nothing would store the new one).
+		if online && s.dir.TokenDue(dev.Name) {
+			if next, err := s.dir.RotateToken(dev.Name); err == nil {
+				json.NewEncoder(w).Encode(map[string]string{"token": next})
+				return
+			}
+		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	mux.HandleFunc("/_pms/rename", authed(func(w http.ResponseWriter, r *http.Request, dev directory.Device) {

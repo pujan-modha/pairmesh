@@ -126,7 +126,7 @@ func usage() {
   pmc expose 53 --udp         expose raw UDP  :53
   pmc serve ssh               serve this box's sshd to paired devices
   pmc unserve ssh             stop serving sshd
-  pmc ssh <name> [-- cmd]     SSH into a paired device (names, not tokens)
+  pmc ssh [user@]<name> [-- cmd]  SSH into a paired device (names, not tokens)
   pmc devices                 paired devices + presence
   pmc list                    this device's exposes
   pmc status                  tunnel + daemon health
@@ -434,9 +434,20 @@ func cmdSSH(args []string) error {
 	args = hoist(args, "config")
 	_ = fs.Parse(args)
 	if fs.NArg() < 1 {
-		return fmt.Errorf("usage: pmc ssh <name> [-- cmd]")
+		return fmt.Errorf("usage: pmc ssh [user@]<name> [-- cmd]")
 	}
-	name := fs.Arg(0)
+	// Optional login user (`pmc ssh pujan@office`): the device identity
+	// (TOFU pin) stays on <name>; the user only picks the far-end login.
+	login, name := "", fs.Arg(0)
+	if i := strings.LastIndex(name, "@"); i >= 0 {
+		login, name = name[:i], name[i+1:]
+	}
+	if login != "" && !validLogin(login) {
+		return fmt.Errorf("bad login user %q", login)
+	}
+	if name == "" {
+		return fmt.Errorf("usage: pmc ssh [user@]<name> [-- cmd]")
+	}
 	cfg := loadPMC(*cp)
 	if cfg.Device == "" || cfg.Token == "" {
 		return fmt.Errorf("not paired — pmc pair <code> first")
@@ -512,12 +523,35 @@ func cmdSSH(args []string) error {
 		// layer too; changed keys still fail loudly — consistent with the
 		// tailcat-level pin checked above).
 		"-o", "HostKeyAlias=" + name, "-o", "StrictHostKeyChecking=accept-new",
-		"127.0.0.1",
+		sshTarget(login),
 	}
 	sshArgs = append(sshArgs, cmdArgs...)
 	ssh := exec.Command("ssh", sshArgs...)
 	ssh.Stdin, ssh.Stdout, ssh.Stderr = os.Stdin, os.Stdout, os.Stderr
 	return ssh.Run()
+}
+
+// sshTarget renders the stock-ssh destination for an optional login user.
+func sshTarget(login string) string {
+	if login == "" {
+		return "127.0.0.1"
+	}
+	return login + "@127.0.0.1"
+}
+
+// validLogin accepts POSIX-ish login names; stock ssh re-validates anyway.
+func validLogin(s string) bool {
+	if len(s) == 0 || len(s) > 32 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		ok := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' && i > 0 || c == '_' || c == '-' || c == '.'
+		if !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func portOf(addr string) string {
@@ -792,7 +826,7 @@ func runDaemon(cfgPath string) {
 			srv = s
 			addr = string(s.TailcatAddr())
 		}
-		heartbeat(cfg, addr)
+		heartbeat(cfgPath, cfg, addr)
 		if srv != nil {
 			log.Printf("pmc: serving as %q (allow %d peers)", cfg.Device, len(allow))
 		}
@@ -828,7 +862,7 @@ func runDaemon(cfgPath string) {
 			if srv != nil {
 				addr = string(srv.TailcatAddr())
 			}
-			heartbeat(cfg, addr)
+			heartbeat(cfgPath, cfg, addr)
 		case <-allowTick.C:
 			cfg = loadPMC(cfgPath)
 			// Restart serving only when membership/exposes actually
@@ -1025,8 +1059,8 @@ func fetchAllowlist(cfg config.PMCConfig) ([]string, error) {
 	return allow, nil
 }
 
-func heartbeat(cfg config.PMCConfig, fullAddr string) {
-	postPresence(cfg, fullAddr, true)
+func heartbeat(path string, cfg config.PMCConfig, fullAddr string) {
+	postPresence(path, cfg, fullAddr, true)
 }
 
 // markOffline tells the directory this device is going away (best effort;
@@ -1036,10 +1070,10 @@ func markOffline(path string) {
 	if cfg.Device == "" || cfg.Token == "" {
 		return
 	}
-	postPresence(cfg, "", false)
+	postPresence(path, cfg, "", false)
 }
 
-func postPresence(cfg config.PMCConfig, fullAddr string, online bool) {
+func postPresence(path string, cfg config.PMCConfig, fullAddr string, online bool) {
 	specs := exposeSpecs(cfg)
 	body, _ := json.Marshal(map[string]any{
 		"full_addr": fullAddr, "exposes": specs, "online": online,
@@ -1047,8 +1081,21 @@ func postPresence(cfg config.PMCConfig, fullAddr string, online bool) {
 	req, _ := http.NewRequest("POST", apiBase(cfg)+"/_pms/heartbeat", bytes.NewReader(body))
 	req.Header.Set("X-Device", cfg.Device)
 	req.Header.Set("Authorization", "Bearer "+cfg.Token)
-	if resp, err := apiClient.Do(req); err == nil {
-		resp.Body.Close()
+	resp, err := apiClient.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	// Rotation: a 200 carries the replacement bearer — persist before next
+	// use. Absent (204) means keep the current one.
+	if resp.StatusCode == http.StatusOK {
+		var out struct {
+			Token string `json:"token"`
+		}
+		if json.NewDecoder(resp.Body).Decode(&out) == nil && out.Token != "" {
+			cfg.Token = out.Token
+			_ = savePMC(path, &cfg)
+		}
 	}
 }
 

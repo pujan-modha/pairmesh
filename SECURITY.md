@@ -10,7 +10,9 @@ ports. If that sentence scares you, run two `pms` hosts.
   unknown/expired/used/locked (no oracle), 5/min/IP rate-limit. Share over a
   private channel. Close enrollment when done: `pms lock`.
 - **Device tokens** = bearer auth to directory/heartbeat (SHA-256 at rest,
-  0600 files). Rotate by re-pairing.
+  0600 files). Rotated automatically every hour on heartbeat, old token
+  surviving a 5-minute grace window (crash between receive and store).
+  Rotate immediately anytime via re-pairing; revoke via `pms unpair`.
 - **`tc...` addresses** contain the WireGuard PSK — bearer dial capability.
   Never logged, never in DNS. DNS TXT is public by definition; our CLIs
   never accept DNS names for secret servers.
