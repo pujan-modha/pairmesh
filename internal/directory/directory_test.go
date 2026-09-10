@@ -142,3 +142,26 @@ func TestRotateToken(t *testing.T) {
 		t.Fatalf("rotate unknown err = %v", err)
 	}
 }
+
+// SetSSHUsers replaces (never appends): unserve clears the hint.
+func TestSetSSHUsers(t *testing.T) {
+	d := New(t.TempDir() + "/dir.db")
+	name, _, err := d.Add("box", "nodekey:aaa", "tc1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetSSHUsers(name, []string{"bob"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetSSHUsers(name, []string{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, dev := range d.List() {
+		if dev.Name == name && len(dev.SSHUsers) != 0 {
+			t.Fatalf("stale ssh users: %+v", dev)
+		}
+	}
+	if err := d.SetSSHUsers("nope", []string{"x"}); err != ErrNotFound {
+		t.Fatalf("unknown err = %v", err)
+	}
+}

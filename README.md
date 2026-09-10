@@ -30,13 +30,13 @@ pmc pair <code>            # once — auto-named, e.g. kabir-tp-a1b2
 pmc 3000 --as next         # → https://next.pairmesh.com (H1+H2+H3 via Caddy)
 pmc serve ssh              # serve sshd to paired devices (no public port)
 pmc up -d                  # daemon holds the tunnel + heartbeat (required!)
-pmc ssh <name>             # office ↔ home, names not tokens
+pmc ssh [user@]<name>      # office ↔ home, names not tokens (bare = your own login)
 ```
 
 ## Commands
 
 `pms`: `init pair devices unpair lock|unlock status run`
-`pmc`: `pair | 3000 --as next | expose --tcp/--udp | serve/unserve ssh | ssh <name> | devices list status rename unexpose | up [-d] down`
+`pmc`: `pair | 3000 --as next | expose --tcp/--udp | serve/unserve ssh | ssh [user@]<name> | devices list status rename unexpose | up [-d] down`
 
 Flags work anywhere: `pmc 3000 --as next --config X` ≡ any order.
 Config files: `/etc/pms/config.yaml`, `~/.config/pmc/config.yaml` (0600).

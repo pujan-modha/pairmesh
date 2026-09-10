@@ -39,7 +39,7 @@ browser --TCP 80/443 + UDP 443--> pms (VM, linux only, runs as root for :443)
   for one name. Self-signed/`sha256-raw` derper nodes are dev-only —
   production needs the publicly-trusted hostname.
 * `pmc` wraps `tailcat.Server` (`OnTCP`/`OnUDP`) + persistent `~/.config/pmc/` keys + expose table. No inbound ports, no root, userspace only.
-* Multi-client, closed group (updated): any number of `pmc` devices pair to one `pms`. After pairing, every paired device can reach every other paired device's served ports — full mesh, zero per-peer config. `pms` is the trusted introducer + directory (`name → {pubkey, fullAddr, online}`); data goes P2P (direct UDP when possible, own-derper relay otherwise). Public web edge (Caddy) is one use of the mesh; device-to-device (`pmc ssh <name>`) is the other. No tenant isolation — one trust domain per `pms`.
+* Multi-client, closed group (updated): any number of `pmc` devices pair to one `pms`. After pairing, every paired device can reach every other paired device's served ports — full mesh, zero per-peer config. `pms` is the trusted introducer + directory (`name → {pubkey, fullAddr, online}`); data goes P2P (direct UDP when possible, own-derper relay otherwise). Public web edge (Caddy) is one use of the mesh; device-to-device (`pmc ssh <name>`) is the other. Serving boxes advertise their login (`pmc devices` shows `office [ssh: bob]`) as a discovery hint only — dialing still defaults to your own login like stock ssh. No tenant isolation — one trust domain per `pms`.
 * Default DERP is **never** used in prod: `pms init` bakes the embedded DERP hostname into full (self-contained) tokens (`--full-address` form, no client map fetch). Public `tailcat.dev` map only as dev fallback with loud warning. Pin tailcat lib + derper build to the same upstream rev and upgrade together (`--verify-clients` needs same-rev tailscaled; we skip it — tailcat `--allow` is the gate).
 * tailcat is wrapped behind our `bridge` interface (no direct imports outside `internal/bridge`). Upstream promises no API/CLI/wire stability (`tailcat.go:29-33`); pin `go.mod`, expect gVisor/Tailscale bumps to break reflect hacks. Build with upstream release tags (`build-tags.txt`, `-tags "$(cat build-tags.txt)" -ldflags "-s -w"`).
 
@@ -64,7 +64,7 @@ pmc expose 5432 --tcp 5432  # → <domain>:5432 → localhost:5432 (raw TCP)
 pmc expose 53 --udp 53      # raw UDP (DNS/game/WG/H3-origin)
 pmc serve ssh       # serve this box's sshd to the mesh (key auth, no public port)
 pmc unserve ssh     # stop serving sshd
-pmc ssh <name>      # dial a paired device by name, no token — e.g. pmc ssh kabir-tp-a1b2
+pmc ssh [user@]<name>  # dial a paired device by name, no token — e.g. pmc ssh kabir-tp-a1b2 (bare = your login; `pmc devices` shows who serves ssh as whom)
 pmc devices         # paired devices + online + direct/relay
 pmc list            # exposes + healthy/direct-vs-relay
 pmc status          # tunnel, last handshake, reconnect count

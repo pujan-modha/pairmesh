@@ -507,8 +507,9 @@ func (s *server) routes() http.Handler {
 		body, _ := io.ReadAll(io.LimitReader(r.Body, 64<<10))
 		var req struct {
 			FullAddr string    `json:"full_addr"`
-			Exposes  *[]string `json:"exposes"` // nil = absent, keep old
-			Online   *bool     `json:"online"`  // nil = true (legacy daemons)
+			Exposes  *[]string `json:"exposes"`  // nil = absent, keep old
+			Online   *bool     `json:"online"`   // nil = true (legacy daemons)
+			SSHUser  string    `json:"ssh_user"` // serving login, "" = not serving ssh
 		}
 		if err := json.Unmarshal(body, &req); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
@@ -527,6 +528,15 @@ func (s *server) routes() http.Handler {
 		_ = s.dir.Heartbeat(dev.Name, addr, online)
 		if req.Exposes != nil {
 			_ = s.dir.SetExposes(dev.Name, *req.Exposes)
+		}
+		// Serving login hint ("" clears on unserve). Discovery only —
+		// dialing still defaults to your own login.
+		if online {
+			users := []string{}
+			if req.SSHUser != "" {
+				users = append(users, req.SSHUser)
+			}
+			_ = s.dir.SetSSHUsers(dev.Name, users)
 		}
 		// Bearer rotation: tokens older than TokenTTL are swapped on the
 		// heartbeat that notices, returned once in-band. The old one stays

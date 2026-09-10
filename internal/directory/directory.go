@@ -18,10 +18,14 @@ import (
 
 // Device is one paired pmc box.
 type Device struct {
-	Name      string   `json:"name"`
-	PubKey    string   `json:"pubkey"` // nodekey:... (allowlist identity)
-	FullAddr  string   `json:"full_addr,omitempty"`
-	Exposes   []string `json:"exposes,omitempty"`    // compact specs: web:<as>:<local> tcp:<pub>:<local> udp:<pub>:<local> ssh
+	Name     string   `json:"name"`
+	PubKey   string   `json:"pubkey"` // nodekey:... (allowlist identity)
+	FullAddr string   `json:"full_addr,omitempty"`
+	Exposes  []string `json:"exposes,omitempty"` // compact specs: web:<as>:<local> tcp:<pub>:<local> udp:<pub>:<local> ssh
+	// SSHUsers lists local accounts serving sshd here, first-seen order.
+	// Discovery hint only ("ssh as bob?") — dialing still defaults to
+	// your own login like stock ssh; pass user@ to choose.
+	SSHUsers  []string `json:"ssh_users,omitempty"`
 	TokenHash []byte   `json:"token_hash,omitempty"` // sha256(device bearer token)
 	// Previous token during the rotation grace window (crash between
 	// receiving and storing the new one must not lock the device out).
@@ -212,6 +216,24 @@ func (d *Directory) SetExposes(name string, ex []string) error {
 	for i, dev := range st.Devices {
 		if dev.Name == name {
 			st.Devices[i].Exposes = append([]string(nil), ex...)
+			return d.saveLocked(st)
+		}
+	}
+	return ErrNotFound
+}
+
+// SetSSHUsers replaces the serving-login hint set. One daemon serves one
+// login, so replace (not append) keeps `unserve` honest — no stale names.
+func (d *Directory) SetSSHUsers(name string, users []string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	st, err := d.loadLocked()
+	if err != nil {
+		return err
+	}
+	for i, dev := range st.Devices {
+		if dev.Name == name {
+			st.Devices[i].SSHUsers = append([]string(nil), users...)
 			return d.saveLocked(st)
 		}
 	}

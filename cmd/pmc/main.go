@@ -5,7 +5,7 @@
 //	  pmc 3000 --as next        expose localhost:3000 as https://next.<domain>
 //	  pmc expose 5432 --tcp     expose raw TCP
 //	  pmc serve ssh             serve this box's sshd (127.0.0.1:22) to the mesh
-//	  pmc ssh <name> [-- cmd]   open SSH to a paired device (no tokens)
+//	  pmc ssh [user@]<name> [-- cmd]  open SSH to a paired device (no tokens)
 //	  pmc devices | pmc list | pmc status
 //	  pmc rename <name> | pmc unexpose <as> | pmc up [-d] | pmc down
 package main
@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -580,6 +581,9 @@ func cmdDevices(args []string) error {
 		if d.Name == cfg.Device {
 			mark = " (this device)"
 		}
+		if len(d.SSHUsers) > 0 {
+			mark += fmt.Sprintf(" [ssh: %s]", strings.Join(d.SSHUsers, ", "))
+		}
 		fmt.Printf("%-24s %-7s%s\n", d.Name, st, mark)
 	}
 	return nil
@@ -913,6 +917,7 @@ func directoryFetch(cfg config.PMCConfig) (devs []struct {
 	Name     string    `json:"name"`
 	Online   bool      `json:"online"`
 	LastSeen time.Time `json:"last_seen"`
+	SSHUsers []string  `json:"ssh_users"`
 }, rev uint64, err error) {
 	req, _ := http.NewRequest("GET", apiBase(cfg)+"/_pms/directory", nil)
 	req.Header.Set("X-Device", cfg.Device)
@@ -931,6 +936,7 @@ func directoryFetch(cfg config.PMCConfig) (devs []struct {
 			Name     string    `json:"name"`
 			Online   bool      `json:"online"`
 			LastSeen time.Time `json:"last_seen"`
+			SSHUsers []string  `json:"ssh_users"`
 		} `json:"devices"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -1077,6 +1083,7 @@ func postPresence(path string, cfg config.PMCConfig, fullAddr string, online boo
 	specs := exposeSpecs(cfg)
 	body, _ := json.Marshal(map[string]any{
 		"full_addr": fullAddr, "exposes": specs, "online": online,
+		"ssh_user": servingUser(cfg),
 	})
 	req, _ := http.NewRequest("POST", apiBase(cfg)+"/_pms/heartbeat", bytes.NewReader(body))
 	req.Header.Set("X-Device", cfg.Device)
@@ -1117,6 +1124,19 @@ func exposeSpecs(cfg config.PMCConfig) []string {
 		out = append(out, "ssh")
 	}
 	return out
+}
+
+// servingUser reports the local login serving sshd, or "" when not serving.
+// Discovery hint only (shown in `pmc devices`); dialing still defaults to
+// your own login like stock ssh — pass user@ to choose.
+func servingUser(cfg config.PMCConfig) string {
+	if !cfg.ServeSSH {
+		return ""
+	}
+	if u, err := user.Current(); err == nil && u.Username != "" {
+		return u.Username
+	}
+	return os.Getenv("USER")
 }
 
 func clientKey(cfg config.PMCConfig) (key.NodePrivate, error) {
