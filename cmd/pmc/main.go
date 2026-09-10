@@ -255,10 +255,8 @@ func cmdPair(args []string) error {
 	if err := savePMC(*cp, &cfg); err != nil {
 		return err
 	}
-	pokeDaemon(cfg) // a running daemon picks up the fresh token at once
 	fmt.Printf("paired as %q\n", out.Name)
-	fmt.Println("next:  pmc 3000 --as next     (expose web)")
-	fmt.Println("       pmc serve ssh          (serve sshd to the mesh)")
+	ensureDaemon(*cp, cfg) // pair takes effect immediately, no `up` step
 	return nil
 }
 
@@ -337,17 +335,17 @@ func cmdExpose(args []string) error {
 	if err := savePMC(*cp, &cfg); err != nil {
 		return err
 	}
-	pokeDaemon(cfg)
 	switch {
 	case *as != "":
-		fmt.Printf("exposed https://%s.%s → localhost:%d (applies on pmc up)\n", *as, cfg.Domain, local)
+		fmt.Printf("exposed https://%s.%s → localhost:%d\n", *as, cfg.Domain, local)
 	case *host != "":
-		fmt.Printf("exposed https://%s → localhost:%d (DNS must point here; applies on pmc up)\n", *host, local)
+		fmt.Printf("exposed https://%s → localhost:%d (DNS must point here)\n", *host, local)
 	case *tcp != 0:
-		fmt.Printf("exposed :%d → localhost:%d (applies on pmc up)\n", *tcp, local)
+		fmt.Printf("exposed :%d → localhost:%d\n", *tcp, local)
 	default:
-		fmt.Printf("exposed udp :%d → localhost:%d (applies on pmc up)\n", *udp, local)
+		fmt.Printf("exposed udp :%d → localhost:%d\n", *udp, local)
 	}
+	ensureDaemon(*cp, cfg) // live within a minute, no `up` step
 	return nil
 }
 
@@ -396,8 +394,8 @@ func cmdServe(args []string) error {
 	if err := savePMC(*cp, &cfg); err != nil {
 		return err
 	}
-	pokeDaemon(cfg)
-	fmt.Println("sshd will be served to paired devices (key auth; no public port). Applies on pmc up.")
+	fmt.Println("sshd will be served to paired devices (key auth; no public port).")
+	ensureDaemon(*cp, cfg)
 	return nil
 }
 
@@ -699,36 +697,7 @@ func cmdUp(args []string) error {
 		return fmt.Errorf("not paired — pmc pair <code> first")
 	}
 	if *daemon {
-		// Advisory pre-check so a duplicate `up -d` fails HERE with a
-		// clear error instead of spawning a child that immediately
-		// refuses in the log file. (The child re-checks under its own
-		// lock — this is just UX, the lock is the arbiter.)
-		if p := pid.Read(pidPath(cfg)); pid.Live(p, "pmc") && pid.Busy(pidPath(cfg)) {
-			return fmt.Errorf("daemon already running (pid %d) — pmc down first", p)
-		}
-		bin, err := os.Executable()
-		if err != nil {
-			return err
-		}
-		// Detached daemons log to a file, never to the void: a silent
-		// daemon is undiagnosable (this exact trap cost real debugging).
-		logPath := filepath.Join(cfg.DataDir, "pmc.log")
-		cmd := exec.Command(bin, "up", "--config", *cp)
-		cmd.Env = os.Environ()
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-		cmd.Stdin = nil
-		// Open here so a bad data dir fails loudly in the parent.
-		lf, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-		if err != nil {
-			return fmt.Errorf("daemon log %s: %w", logPath, err)
-		}
-		defer lf.Close()
-		cmd.Stdout, cmd.Stderr = lf, lf
-		if err := cmd.Start(); err != nil {
-			return err
-		}
-		fmt.Printf("daemon starting (log %s; verify with: pmc status)\n", logPath)
-		return nil
+		return startDetached(*cp, cfg)
 	}
 	// Foreground daemon (and the detached child above): singleton via file
 	// lock, not pid existence. The lock dies with the process, so crashes
@@ -741,6 +710,54 @@ func cmdUp(args []string) error {
 	defer lock.Close()
 	runDaemon(*cp)
 	return nil
+}
+
+// startDetached launches the daemon in the background (log file, never the
+// void: a silent daemon is undiagnosable).
+func startDetached(cfgPath string, cfg config.PMCConfig) error {
+	// Advisory pre-check so a duplicate fails HERE with a clear error
+	// instead of spawning a child that immediately refuses in the log
+	// file. (The child re-checks under its own lock — this is just UX,
+	// the lock is the arbiter.)
+	if p := pid.Read(pidPath(cfg)); pid.Live(p, "pmc") && pid.Busy(pidPath(cfg)) {
+		return fmt.Errorf("daemon already running (pid %d) — pmc down first", p)
+	}
+	bin, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	logPath := filepath.Join(cfg.DataDir, "pmc.log")
+	cmd := exec.Command(bin, "up", "--config", cfgPath)
+	cmd.Env = os.Environ()
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	cmd.Stdin = nil
+	// Open here so a bad data dir fails loudly in the parent.
+	lf, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("daemon log %s: %w", logPath, err)
+	}
+	defer lf.Close()
+	cmd.Stdout, cmd.Stderr = lf, lf
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	fmt.Printf("daemon starting (log %s; verify with: pmc status)\n", logPath)
+	return nil
+}
+
+// ensureDaemon starts the daemon if it isn't running. Called after
+// pair/expose/serve so those commands take effect without a separate
+// `pmc up` step — daily use never touches up/down/status.
+func ensureDaemon(cfgPath string, cfg config.PMCConfig) {
+	if isDaemonUp(cfg) {
+		pokeDaemon(cfg)
+		return
+	}
+	if err := startDetached(cfgPath, cfg); err != nil {
+		fmt.Printf("note: daemon did not start (%v) — run `pmc up -d` to retry\n", err)
+		return
+	}
+	fmt.Println("daemon started in the background (takes effect within a minute)")
 }
 
 func cmdDown(args []string) error {

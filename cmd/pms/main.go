@@ -12,6 +12,7 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -20,6 +21,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -108,6 +110,7 @@ func cmdInit(args []string) error {
 	domain := fs.String("domain", "", "public domain (required)")
 	email := fs.String("email", "", "ACME email (required)")
 	cfgPath := fs.String("config", "/etc/pms/config.yaml", "config path")
+	noService := fs.Bool("no-service", false, "skip systemd install (containers, non-systemd)")
 	_ = fs.Parse(args)
 	if *domain == "" || *email == "" {
 		return fmt.Errorf("init: --domain and --email are required\n  e.g. pms init --domain pairmesh.com --email you@mail.com")
@@ -125,12 +128,70 @@ func cmdInit(args []string) error {
 		return fmt.Errorf("init: data dir %s: %w (run as root or set PMS_DATA_DIR)", dataDir, err)
 	}
 	fmt.Printf("wrote %s\n", *cfgPath)
+	if !*noService {
+		manageService(*cfgPath)
+	}
 	fmt.Println("next:")
 	fmt.Println("  1. point DNS at this VM:  A <domain> / A *.<domain> / A derp.<domain>")
 	fmt.Println("  2. install caddy + derper binaries on PATH, open TCP 80/443 + UDP 443/3478")
-	fmt.Println("  3. pms run   (or enable the systemd unit)")
-	fmt.Println("  4. pms pair  (link your first device)")
+	fmt.Println("  3. pms pair  (link your first device; daemon already running if installed above)")
 	return nil
+}
+
+//go:embed pms.service
+var unitTemplate string
+
+// manageService installs + enables the systemd unit when that makes sense:
+// root + systemd PID 1 + not in a container. Otherwise it prints the manual
+// step instead of failing — init's job is config, the service is a bonus.
+func manageService(cfgPath string) {
+	if !shouldManageService(os.Geteuid() == 0, hasSystemd(), inContainer()) {
+		printManualService()
+		return
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		fmt.Printf("service: cannot locate binary (%v) — enable manually\n", err)
+		return
+	}
+	// Render the unit for THIS binary and THIS config (not the /usr/local
+	// defaults baked into the template).
+	unit := strings.Replace(unitTemplate, "/usr/local/bin/pms", exe, 1)
+	unit = strings.Replace(unit, "--config /etc/pms/config.yaml", "--config "+cfgPath, 1)
+	if err := os.WriteFile("/etc/systemd/system/pms.service", []byte(unit), 0o644); err != nil {
+		fmt.Printf("service: cannot write unit (%v) — enable manually\n", err)
+		return
+	}
+	if out, err := exec.Command("systemctl", "daemon-reload").CombinedOutput(); err != nil {
+		fmt.Printf("service: daemon-reload failed (%s) — enable manually\n", out)
+		return
+	}
+	if out, err := exec.Command("systemctl", "enable", "--now", "pms").CombinedOutput(); err != nil {
+		fmt.Printf("service: enable failed (%s) — start with `systemctl start pms`\n", out)
+		return
+	}
+	fmt.Println("service: pms enabled and started (systemctl status pms)")
+}
+
+// shouldManageService reports whether `init` would install the unit.
+// Factored for tests (real checks read euid, PID 1, and /.dockerenv).
+func shouldManageService(euidZero, hasSystemd, inContainer bool) bool {
+	return euidZero && hasSystemd && !inContainer
+}
+
+func hasSystemd() bool {
+	_, err := os.Stat("/run/systemd/system")
+	return err == nil
+}
+
+func inContainer() bool {
+	_, err := os.Stat("/.dockerenv")
+	return err == nil
+}
+
+func printManualService() {
+	fmt.Println("service: skipping systemd install — enable the daemon yourself:")
+	fmt.Println("  systemctl enable --now pms   (or run `pms run` under your supervisor)")
 }
 
 func cmdPair(args []string) error {

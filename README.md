@@ -18,7 +18,7 @@ pms init --domain pairmesh.com --email you@mail.com
 # DNS: A pairmesh.com, *.pairmesh.com, derp.pairmesh.com → VM IP
 # needs (installed by the script): pms + caddy (our build WITH caddy-l4)
 #   + derper binaries, TCP 80/443 + UDP 443/3478 open
-systemctl enable --now pms
+# init installs + starts the systemd unit itself (or use --no-service)
 pms pair     # → pmc pair <code>
 ```
 
@@ -26,10 +26,9 @@ Laptop (behind NAT, no ports, no root):
 
 ```bash
 curl -fsSL https://get.pairmesh.com | sh -s -- client
-pmc pair <code>            # once — auto-named, e.g. kabir-tp-a1b2
-pmc 3000 --as next         # → https://next.pairmesh.com (H1+H2+H3 via Caddy)
+pmc pair <code>            # once — auto-named; daemon starts itself
+pmc 3000 --as next         # → https://next.pairmesh.com (live within a minute)
 pmc serve ssh              # serve sshd to paired devices (no public port)
-pmc up -d                  # daemon holds the tunnel + heartbeat (required!)
 pmc ssh [user@]<name>      # office ↔ home, names not tokens (bare = your own login)
 ```
 

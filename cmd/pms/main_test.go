@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/pujan-modha/pairmesh/internal/config"
@@ -34,6 +35,35 @@ func TestValidateConfig(t *testing.T) {
 		mutate(&cfg)
 		if err := validateConfig(cfg); err == nil {
 			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+func TestShouldManageService(t *testing.T) {
+	if !shouldManageService(true, true, false) {
+		t.Error("root+systemd+bare metal should manage")
+	}
+	for name, tc := range map[string][3]bool{
+		"non-root":   {false, true, false},
+		"no systemd": {true, false, false},
+		"container":  {true, true, true},
+		"nothing":    {false, false, true},
+	} {
+		if shouldManageService(tc[0], tc[1], tc[2]) {
+			t.Errorf("%s: should not manage", name)
+		}
+	}
+}
+
+func TestUnitTemplateRenders(t *testing.T) {
+	if unitTemplate == "" {
+		t.Fatal("embedded unit empty")
+	}
+	// The template must keep its /usr/local placeholders: init renders
+	// the real binary + config paths per machine at install time.
+	for _, want := range []string{"/usr/local/bin/pms", "--config /etc/pms/config.yaml"} {
+		if !strings.Contains(unitTemplate, want) {
+			t.Errorf("unit template lost placeholder %q", want)
 		}
 	}
 }
