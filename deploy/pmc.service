@@ -1,0 +1,18 @@
+[Unit]
+Description=pairmesh client (tailcat serve + heartbeat)
+After=network-online.target
+Wants=network-online.target
+
+# User unit (systemctl --user enable --now pmc): must keep $HOME writable
+# for ~/.config/pmc (config, identity, pid, allowlist cache, known_peers).
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/pmc up
+Restart=always
+RestartSec=2
+TimeoutStopSec=15
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target

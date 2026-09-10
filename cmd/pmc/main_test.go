@@ -1,0 +1,84 @@
+package main
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/pujan-modha/pairmesh/internal/config"
+)
+
+func TestGuessDerpHost(t *testing.T) {
+	for url, want := range map[string]string{
+		"https://pair.example.com":      "derp.example.com",
+		"https://pair.example.com:8443": "derp.example.com",
+		"https://example.com":           "example.com",
+		"http://127.0.0.1:18923":        "127.0.0.1",
+		"http://[::1]:18923":            "::1",
+		"https://user@pair.example.com": "derp.example.com",
+	} {
+		if got := guessDerpHost(url); got != want {
+			t.Errorf("guessDerpHost(%q) = %q, want %q", url, got, want)
+		}
+	}
+}
+
+// withStdin swaps os.Stdin for the duration of fn.
+func withStdin(t *testing.T, input string, fn func() error) error {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stdin
+	os.Stdin = r
+	defer func() { os.Stdin = old }()
+	if input != "" {
+		if _, err := w.WriteString(input); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = w.Close()
+	return fn()
+}
+
+func testCfg(dir string) config.PMCConfig {
+	return config.PMCConfig{DataDir: dir}
+}
+
+// EOF (pipes, scripts, cron) must NOT trust: fail closed.
+func TestTrustCheckEOFAborts(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testCfg(dir)
+	p := peerInfo{Name: "office", PubKey: "nodekey:aaa", FullAddr: "tcAAA"}
+	if err := withStdin(t, "", func() error { return trustCheck(cfg, p) }); err == nil {
+		t.Fatal("EOF accepted trust; must abort")
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, "known_peers")); err == nil {
+		var known map[string]string
+		_ = json.Unmarshal(b, &known)
+		if _, ok := known["office"]; ok {
+			t.Fatal("unconfirmed peer was pinned")
+		}
+	}
+}
+
+// Explicit yes pins.
+func TestTrustCheckYesPins(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testCfg(dir)
+	p := peerInfo{Name: "office", PubKey: "nodekey:aaa", FullAddr: "tcAAA"}
+	if err := withStdin(t, "y\n", func() error { return trustCheck(cfg, p) }); err != nil {
+		t.Fatalf("explicit yes refused: %v", err)
+	}
+	// Second sighting of the same key passes silently.
+	if err := withStdin(t, "", func() error { return trustCheck(cfg, p) }); err != nil {
+		t.Fatalf("known key re-prompted/failed: %v", err)
+	}
+	// Changed key aborts loudly even with yes on stdin.
+	p.PubKey = "nodekey:evil"
+	if err := withStdin(t, "y\n", func() error { return trustCheck(cfg, p) }); err == nil {
+		t.Fatal("changed identity accepted")
+	}
+}

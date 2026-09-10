@@ -1,0 +1,30 @@
+# Binaries and release artifacts
+/pms
+/pmc
+/*-linux-*
+/*-darwin-*
+/*-windows-*
+*.tar.gz
+*.zip
+*.deb
+*.rpm
+dist/
+
+# Go
+*.test
+*.out
+coverage.txt
+coverage.html
+/vendor/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# Local test state (never commit pairing material, keys, or tokens)
+*.db
+*.pid
+*_test-config/

@@ -1,0 +1,78 @@
+name: release
+
+# Produces exactly what deploy/install.sh fetches:
+#   <bin>-<os>-<arch>.tar.gz  (+ SHA256SUMS)
+# Artifacts: pms (linux), pmc (linux+darwin), caddy+l4 (linux),
+# derper (linux). Pinned versions live in go.mod / deploy/Dockerfile.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  go-bins:
+    strategy:
+      matrix:
+        include:
+          - { bin: pms, goos: linux, goarch: amd64 }
+          - { bin: pms, goos: linux, goarch: arm64 }
+          - { bin: pmc, goos: linux, goarch: amd64 }
+          - { bin: pmc, goos: linux, goarch: arm64 }
+          - { bin: pmc, goos: darwin, goarch: amd64 }
+          - { bin: pmc, goos: darwin, goarch: arm64 }
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+          cache: true
+      - run: GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o ${{ matrix.bin }} ./cmd/${{ matrix.bin }}
+      - run: tar -czf ${{ matrix.bin }}-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz ${{ matrix.bin }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.bin }}-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ${{ matrix.bin }}-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
+
+  caddy-derper:
+    strategy:
+      matrix:
+        include:
+          - { goarch: amd64 }
+          - { goarch: arm64 }
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+          cache: true
+      # caddy with the layer4 module (pinned rev; keep in sync with README)
+      - run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+      - run: CGO_ENABLED=0 GOARCH=${{ matrix.goarch }} ~/go/bin/xcaddy build --with github.com/mholt/caddy-l4@v0.1.2 --output caddy
+      - run: tar -czf caddy-linux-${{ matrix.goarch }}.tar.gz caddy
+      # derper pinned via go.mod (see tools/tools.go)
+      - run: CGO_ENABLED=0 GOARCH=${{ matrix.goarch }} go build -trimpath -ldflags "-s -w" -o derper tailscale.com/cmd/derper
+      - run: tar -czf derper-linux-${{ matrix.goarch }}.tar.gz derper
+      - uses: actions/upload-artifact@v4
+        with:
+          name: edge-linux-${{ matrix.goarch }}
+          path: |
+            caddy-linux-${{ matrix.goarch }}.tar.gz
+            derper-linux-${{ matrix.goarch }}.tar.gz
+
+  publish:
+    needs: [go-bins, caddy-derper]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: cd dist && sha256sum *.tar.gz > SHA256SUMS && cat SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

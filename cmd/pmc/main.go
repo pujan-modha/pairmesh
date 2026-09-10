@@ -1,0 +1,1102 @@
+// Command pmc runs on private machines: pair once, then expose/serve/ssh.
+//
+//	Usage:
+//	  pmc pair <code> [--server https://pair.<domain>]
+//	  pmc 3000 --as next        expose localhost:3000 as https://next.<domain>
+//	  pmc expose 5432 --tcp     expose raw TCP
+//	  pmc serve ssh             serve this box's sshd (127.0.0.1:22) to the mesh
+//	  pmc ssh <name> [-- cmd]   open SSH to a paired device (no tokens)
+//	  pmc devices | pmc list | pmc status
+//	  pmc rename <name> | pmc unexpose <as> | pmc up [-d] | pmc down
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/tailscale/tailcat"
+	"tailscale.com/types/key"
+
+	"github.com/pujan-modha/pairmesh/internal/bridge"
+	"github.com/pujan-modha/pairmesh/internal/config"
+	"github.com/pujan-modha/pairmesh/internal/keys"
+	"github.com/pujan-modha/pairmesh/internal/pid"
+)
+
+func main() {
+	log.SetFlags(0)
+	if len(os.Args) < 2 {
+		usage()
+		os.Exit(2)
+	}
+	// --config anywhere: extract it, find the command as the first
+	// non-flag token, pass everything (plus --config first) to it.
+	rest := os.Args[1:]
+	cfgVal, tmp := pullFlag(rest, "config")
+	rest = tmp
+	cmd := ""
+	cargs := []string{}
+	for i, a := range rest {
+		if cmd == "" && !strings.HasPrefix(a, "-") {
+			cmd, cargs = a, rest[i+1:]
+			break
+		}
+	}
+	if cmd == "" {
+		usage()
+		os.Exit(2)
+	}
+	if cfgVal != "" {
+		cargs = append([]string{"--config", cfgVal}, cargs...)
+	}
+	args := cargs
+	// Bare `pmc 3000` shorthand.
+	if port, err := strconv.Atoi(cmd); err == nil {
+		if err := cmdExpose(append([]string{strconv.Itoa(port)}, args...)); err != nil {
+			fatal(err)
+		}
+		return
+	}
+	var err error
+	switch cmd {
+	case "pair":
+		err = cmdPair(args)
+	case "expose":
+		err = cmdExpose(args)
+	case "serve":
+		err = cmdServe(args)
+	case "unserve":
+		err = cmdUnserve(args)
+	case "ssh":
+		err = cmdSSH(args)
+	case "devices":
+		err = cmdDevices(args)
+	case "list":
+		err = cmdList(args)
+	case "status":
+		err = cmdStatus(args)
+	case "rename":
+		err = cmdRename(args)
+	case "unexpose":
+		err = cmdUnexpose(args)
+	case "up":
+		err = cmdUp(args)
+	case "down":
+		err = cmdDown(args)
+	case "-h", "--help", "help":
+		usage()
+	default:
+		fmt.Fprintf(os.Stderr, "pmc: unknown command %q\n\n", cmd)
+		usage()
+		os.Exit(2)
+	}
+	if err != nil {
+		fatal(err)
+	}
+}
+
+func fatal(err error) {
+	fmt.Fprintf(os.Stderr, "pmc: %v\n", err)
+	os.Exit(1)
+}
+
+func usage() {
+	fmt.Println(`pmc — pairmesh client (runs on private machines)
+
+  pmc pair <code>             link this device (once, no args besides code)
+  pmc 3000 --as next          expose localhost:3000 as https://next.<domain>
+  pmc expose 5432 --tcp       expose raw TCP  :5432
+  pmc expose 53 --udp         expose raw UDP  :53
+  pmc serve ssh               serve this box's sshd to paired devices
+  pmc unserve ssh             stop serving sshd
+  pmc ssh <name> [-- cmd]     SSH into a paired device (names, not tokens)
+  pmc devices                 paired devices + presence
+  pmc list                    this device's exposes
+  pmc status                  tunnel + daemon health
+  pmc rename <name>           request a new device name
+  pmc unexpose <as>           drop an expose
+  pmc up [-d] | pmc down      daemonize / stop (reads config file)
+
+Config: ~/.config/pmc/config.yaml (flags override; token via file/env only).`)
+}
+
+func cfgPath(fs *flag.FlagSet) *string {
+	return fs.String("config", defaultCfgPath(), "config path")
+}
+
+// hoist pulls --names (value or = form) from anywhere in args to the front,
+// so positional-first invocations like `pmc 3000 --as next` parse correctly.
+func hoist(args []string, names ...string) []string {
+	var front []string
+	for _, n := range names {
+		if v, rest := pullFlag(args, n); v != "" {
+			front = append(front, "--"+n, v)
+			args = rest
+		}
+	}
+	return append(front, args...)
+}
+func pullFlag(args []string, name string) (string, []string) {
+	var val string
+	rest := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--"+name && i+1 < len(args) {
+			val = args[i+1]
+			i++
+			continue
+		}
+		if strings.HasPrefix(a, "--"+name+"=") {
+			val = strings.TrimPrefix(a, "--"+name+"=")
+			continue
+		}
+		rest = append(rest, a)
+	}
+	return val, rest
+}
+
+func defaultCfgPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".config", "pmc", "config.yaml")
+}
+
+func loadPMC(path string) config.PMCConfig {
+	cfg := config.DefaultPMC()
+	_ = config.LoadYAML(path, &cfg)
+	if v := os.Getenv("PMC_DATA_DIR"); v != "" {
+		cfg.DataDir = v
+	}
+	if v := os.Getenv("PMC_TOKEN"); v != "" {
+		cfg.Token = v
+	}
+	if v := os.Getenv("PMC_SERVER"); v != "" {
+		cfg.Server = v
+	}
+	return cfg
+}
+
+func savePMC(path string, cfg *config.PMCConfig) error {
+	return config.SaveYAML(path, cfg)
+}
+
+// --- pair ---
+
+func cmdPair(args []string) error {
+	args = hoist(args, "server", "config")
+	fs := flag.NewFlagSet("pair", flag.ExitOnError)
+	cp := cfgPath(fs)
+	server := fs.String("server", "", "pairing URL (default https://pair.<domain>)")
+	_ = fs.Parse(args)
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: pmc pair <code>")
+	}
+	code := fs.Arg(0)
+	cfg := loadPMC(*cp)
+	url := *server
+	if url == "" {
+		if cfg.Server == "" {
+			return fmt.Errorf("no server known — pass --server (e.g. pmc pair <code> --server https://pair.<domain>)")
+		}
+		url = cfg.Server
+	}
+	url = strings.TrimSuffix(url, "/")
+	// Identity first, bound to the real DERP host up front (derived from the
+	// pairing URL), so we have a stable pubkey to send and a killed pair
+	// never leaves a placeholder-region identity behind.
+	id, err := keys.LoadOrCreate(cfg.DataDir, guessDerpHost(url))
+	if err != nil {
+		return err
+	}
+	host, _ := os.Hostname()
+	reqBody, _ := json.Marshal(map[string]string{
+		"code": code, "pubkey": id.NodePub, "hostname": host,
+	})
+	resp, err := apiClient.Post(url+"/_pms/pair", "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		return fmt.Errorf("pair: %w (is the code fresh and the server reachable?)", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("pair: server refused (code invalid, expired, used, or enrollment closed)")
+	}
+	var out struct {
+		Name     string `json:"name"`
+		Token    string `json:"token"`
+		DerpHost string `json:"derp_host"`
+		Domain   string `json:"domain"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return err
+	}
+	// Rebind identity to the real DERP host (node key preserved).
+	if _, err := keys.LoadOrCreate(cfg.DataDir, out.DerpHost); err != nil {
+		return err
+	}
+	cfg.Device, cfg.Token, cfg.Domain = out.Name, out.Token, out.Domain
+	cfg.Server = url // the base URL that worked (stored for devices/heartbeat)
+	if err := savePMC(*cp, &cfg); err != nil {
+		return err
+	}
+	pokeDaemon(cfg) // a running daemon picks up the fresh token at once
+	fmt.Printf("paired as %q\n", out.Name)
+	fmt.Println("next:  pmc 3000 --as next     (expose web)")
+	fmt.Println("       pmc serve ssh          (serve sshd to the mesh)")
+	return nil
+}
+
+// --- expose ---
+
+func cmdExpose(args []string) error {
+	args = hoist(args, "config", "as", "host", "tcp", "udp")
+	fs := flag.NewFlagSet("expose", flag.ExitOnError)
+	cp := cfgPath(fs)
+	as := fs.String("as", "", "public name → https://<as>.<domain>")
+	host := fs.String("host", "", "full custom hostname → local (DNS must point here)")
+	tcp := fs.Int("tcp", -1, "public TCP port")
+	udp := fs.Int("udp", -1, "public UDP port")
+	_ = fs.Parse(args)
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: pmc expose <local-port> [--as name] [--host name] [--tcp port] [--udp port]")
+	}
+	local, err := strconv.Atoi(fs.Arg(0))
+	if err != nil || local <= 0 || local > 65535 {
+		return fmt.Errorf("bad local port %q", fs.Arg(0))
+	}
+	for _, p := range []struct {
+		name string
+		v    int
+	}{{"tcp", *tcp}, {"udp", *udp}} {
+		if p.v != -1 && (p.v <= 0 || p.v > 65535) {
+			return fmt.Errorf("bad --%s port %d", p.name, p.v)
+		}
+	}
+	if *tcp == -1 {
+		*tcp = 0
+	}
+	if *udp == -1 {
+		*udp = 0
+	}
+	cfg := loadPMC(*cp)
+	modes := 0
+	if *as != "" {
+		modes++
+	}
+	if *host != "" {
+		modes++
+	}
+	if *tcp != 0 {
+		modes++
+	}
+	if *udp != 0 {
+		modes++
+	}
+	if modes == 0 {
+		// Bare `pmc 3000` = web expose, auto-named p<port>.
+		*as = fmt.Sprintf("p%d", local)
+		modes = 1
+	}
+	if modes > 1 {
+		return fmt.Errorf("one mode per expose: --as xor --host xor --tcp xor --udp")
+	}
+	if *as != "" && !config.ValidName(*as) {
+		return fmt.Errorf("bad name %q (lowercase letters, digits, hyphens)", *as)
+	}
+	if *host != "" {
+		*host = strings.ToLower(strings.TrimSpace(*host))
+		if !config.ValidHost(*host) {
+			return fmt.Errorf("bad hostname %q", *host)
+		}
+	}
+	// Replace same-local entries.
+	kept := cfg.Exposes[:0]
+	for _, e := range cfg.Exposes {
+		if e.Local != local {
+			kept = append(kept, e)
+		}
+	}
+	kept = append(kept, config.Expose{Local: local, As: *as, Host: *host, TCP: *tcp, UDP: *udp})
+	cfg.Exposes = kept
+	if err := savePMC(*cp, &cfg); err != nil {
+		return err
+	}
+	pokeDaemon(cfg)
+	switch {
+	case *as != "":
+		fmt.Printf("exposed https://%s.%s → localhost:%d (applies on pmc up)\n", *as, cfg.Domain, local)
+	case *host != "":
+		fmt.Printf("exposed https://%s → localhost:%d (DNS must point here; applies on pmc up)\n", *host, local)
+	case *tcp != 0:
+		fmt.Printf("exposed :%d → localhost:%d (applies on pmc up)\n", *tcp, local)
+	default:
+		fmt.Printf("exposed udp :%d → localhost:%d (applies on pmc up)\n", *udp, local)
+	}
+	return nil
+}
+
+func cmdUnexpose(args []string) error {
+	args = hoist(args, "config")
+	fs := flag.NewFlagSet("unexpose", flag.ExitOnError)
+	cp := cfgPath(fs)
+	_ = fs.Parse(args)
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: pmc unexpose <as|port>")
+	}
+	cfg := loadPMC(*cp)
+	key := fs.Arg(0)
+	kept := cfg.Exposes[:0]
+	for _, e := range cfg.Exposes {
+		if e.As != key && strconv.Itoa(e.Local) != key {
+			kept = append(kept, e)
+		}
+	}
+	cfg.Exposes = kept
+	if err := savePMC(*cp, &cfg); err != nil {
+		return err
+	}
+	pokeDaemon(cfg)
+	fmt.Printf("removed %q\n", key)
+	return nil
+}
+
+// --- serve ssh ---
+
+func cmdServe(args []string) error {
+	args = hoist(args, "config")
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	cp := cfgPath(fs)
+	_ = fs.Parse(args)
+	if fs.NArg() != 1 || fs.Arg(0) != "ssh" {
+		return fmt.Errorf("usage: pmc serve ssh")
+	}
+	if c, err := net.DialTimeout("tcp", "127.0.0.1:22", 2*time.Second); err != nil {
+		return fmt.Errorf("no sshd on 127.0.0.1:22 (%v) — start your system SSH server first", err)
+	} else {
+		c.Close()
+	}
+	cfg := loadPMC(*cp)
+	cfg.ServeSSH = true
+	if err := savePMC(*cp, &cfg); err != nil {
+		return err
+	}
+	pokeDaemon(cfg)
+	fmt.Println("sshd will be served to paired devices (key auth; no public port). Applies on pmc up.")
+	return nil
+}
+
+func cmdUnserve(args []string) error {
+	args = hoist(args, "config")
+	fs := flag.NewFlagSet("unserve", flag.ExitOnError)
+	cp := cfgPath(fs)
+	_ = fs.Parse(args)
+	if fs.NArg() != 1 || fs.Arg(0) != "ssh" {
+		return fmt.Errorf("usage: pmc unserve ssh")
+	}
+	cfg := loadPMC(*cp)
+	cfg.ServeSSH = false
+	if err := savePMC(*cp, &cfg); err != nil {
+		return err
+	}
+	pokeDaemon(cfg)
+	fmt.Println("sshd no longer served.")
+	return nil
+}
+
+// --- ssh ---
+
+func cmdSSH(args []string) error {
+	// Split off optional `-- cmd`.
+	var cmdArgs []string
+	for i, a := range args {
+		if a == "--" {
+			cmdArgs, args = args[i+1:], args[:i]
+			break
+		}
+	}
+	fs := flag.NewFlagSet("ssh", flag.ExitOnError)
+	cp := cfgPath(fs)
+	args = hoist(args, "config")
+	_ = fs.Parse(args)
+	if fs.NArg() < 1 {
+		return fmt.Errorf("usage: pmc ssh <name> [-- cmd]")
+	}
+	name := fs.Arg(0)
+	cfg := loadPMC(*cp)
+	if cfg.Device == "" || cfg.Token == "" {
+		return fmt.Errorf("not paired — pmc pair <code> first")
+	}
+	peer, err := directoryLookup(cfg, name)
+	if err != nil {
+		return err
+	}
+	if err := trustCheck(cfg, peer); err != nil {
+		return err
+	}
+	// Local forward → peer:22, then stock ssh with per-name host alias.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
+	tun := bridge.New(nil)
+	ck, err := clientKey(cfg)
+	if err != nil {
+		return err
+	}
+	tun.WithClientKey(ck)
+	tun.WithDERPMapURL(apiBase(cfg) + "/_pms/derpmap.json")
+	defer tun.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Stale addresses (peer re-paired, daemon restarted) refresh once per
+	// connection instead of failing the whole session.
+	var pmu sync.Mutex
+	cur := peer
+	refresh := func() {
+		if p, err := directoryLookup(cfg, name); err == nil && p.FullAddr != "" {
+			pmu.Lock()
+			cur = p
+			pmu.Unlock()
+		}
+	}
+	dialPeer := func() (net.Conn, error) {
+		pmu.Lock()
+		addr := cur.FullAddr
+		pmu.Unlock()
+		up, err := tun.DialTCP(ctx, tailcat.Addr(addr), 22)
+		if err == nil {
+			return up, nil
+		}
+		refresh()
+		pmu.Lock()
+		addr = cur.FullAddr
+		pmu.Unlock()
+		return tun.DialTCP(ctx, tailcat.Addr(addr), 22)
+	}
+	go func() {
+		for {
+			down, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(down net.Conn) {
+				defer down.Close()
+				up, err := dialPeer()
+				if err != nil {
+					return
+				}
+				defer up.Close()
+				tailcat.ProxyConns(down, up)
+			}(down)
+		}
+	}()
+	sshArgs := []string{
+		"-p", portOf(ln.Addr().String()),
+		// Per-name alias (stable known_hosts) + accept-new (TOFU at the SSH
+		// layer too; changed keys still fail loudly — consistent with the
+		// tailcat-level pin checked above).
+		"-o", "HostKeyAlias=" + name, "-o", "StrictHostKeyChecking=accept-new",
+		"127.0.0.1",
+	}
+	sshArgs = append(sshArgs, cmdArgs...)
+	ssh := exec.Command("ssh", sshArgs...)
+	ssh.Stdin, ssh.Stdout, ssh.Stderr = os.Stdin, os.Stdout, os.Stderr
+	return ssh.Run()
+}
+
+func portOf(addr string) string {
+	_, p, _ := net.SplitHostPort(addr)
+	return p
+}
+
+// --- devices / list / status ---
+
+func cmdDevices(args []string) error {
+	args = hoist(args, "config")
+	fs := flag.NewFlagSet("devices", flag.ExitOnError)
+	cp := cfgPath(fs)
+	_ = fs.Parse(args)
+	cfg := loadPMC(*cp)
+	devs, _, err := directoryFetch(cfg)
+	if err != nil {
+		return err
+	}
+	for _, d := range devs {
+		st := "offline"
+		if d.Online && time.Since(d.LastSeen) < 2*time.Minute {
+			st = "online"
+		}
+		mark := ""
+		if d.Name == cfg.Device {
+			mark = " (this device)"
+		}
+		fmt.Printf("%-24s %-7s%s\n", d.Name, st, mark)
+	}
+	return nil
+}
+
+func cmdList(args []string) error {
+	args = hoist(args, "config")
+	fs := flag.NewFlagSet("list", flag.ExitOnError)
+	cp := cfgPath(fs)
+	_ = fs.Parse(args)
+	cfg := loadPMC(*cp)
+	for _, e := range cfg.Exposes {
+		switch {
+		case e.As != "":
+			fmt.Printf("web  https://%s.%s → localhost:%d\n", e.As, cfg.Domain, e.Local)
+		case e.Host != "":
+			fmt.Printf("web  https://%s → localhost:%d\n", e.Host, e.Local)
+		case e.TCP != 0:
+			fmt.Printf("tcp  :%d → localhost:%d\n", e.TCP, e.Local)
+		case e.UDP != 0:
+			fmt.Printf("udp  :%d → localhost:%d\n", e.UDP, e.Local)
+		}
+	}
+	if cfg.ServeSSH {
+		fmt.Println("ssh  (served to paired devices)")
+	}
+	return nil
+}
+
+func cmdStatus(args []string) error {
+	args = hoist(args, "config")
+	fs := flag.NewFlagSet("status", flag.ExitOnError)
+	cp := cfgPath(fs)
+	_ = fs.Parse(args)
+	cfg := loadPMC(*cp)
+	fmt.Printf("device: %s  server: %s\n", cfg.Device, cfg.Server)
+	if isDaemonUp(cfg) {
+		fmt.Println("daemon: running")
+	} else {
+		fmt.Println("daemon: stopped (pmc up)")
+	}
+	return nil
+}
+
+func cmdRename(args []string) error {
+	args = hoist(args, "config")
+	fs := flag.NewFlagSet("rename", flag.ExitOnError)
+	cp := cfgPath(fs)
+	_ = fs.Parse(args)
+	if fs.NArg() != 1 || !config.ValidName(fs.Arg(0)) {
+		return fmt.Errorf("usage: pmc rename <name>  (lowercase, digits, hyphens)")
+	}
+	cfg := loadPMC(*cp)
+	if cfg.Device == "" || cfg.Token == "" {
+		return fmt.Errorf("not paired — pmc pair <code> first")
+	}
+	body, _ := json.Marshal(map[string]string{"name": fs.Arg(0)})
+	req, _ := http.NewRequest("POST", apiBase(cfg)+"/_pms/rename", bytes.NewReader(body))
+	req.Header.Set("X-Device", cfg.Device)
+	req.Header.Set("Authorization", "Bearer "+cfg.Token)
+	resp, err := apiClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK:
+		var out struct {
+			Name string `json:"name"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return err
+		}
+		cfg.Device = out.Name
+		if err := savePMC(*cp, &cfg); err != nil {
+			return err
+		}
+		pokeDaemon(cfg)
+		fmt.Printf("renamed to %q\n", out.Name)
+		return nil
+	case http.StatusConflict:
+		return fmt.Errorf("name %q is taken", fs.Arg(0))
+	default:
+		return fmt.Errorf("rename refused (re-pair?)")
+	}
+}
+
+// --- up / down ---
+
+func pidPath(cfg config.PMCConfig) string { return cfg.DataDir + "/pmc.pid" }
+
+func isDaemonUp(cfg config.PMCConfig) bool {
+	return pid.Live(pid.Read(pidPath(cfg)), "pmc")
+}
+
+func pokeDaemon(cfg config.PMCConfig) {
+	// Best-effort SIGHUP: daemon re-reads config + refreshes heartbeat.
+	if p := pid.Read(pidPath(cfg)); pid.Live(p, "pmc") {
+		if proc, err := os.FindProcess(p); err == nil {
+			_ = proc.Signal(syscall.SIGHUP)
+		}
+	}
+}
+
+func cmdUp(args []string) error {
+	args = hoist(args, "config")
+	fs := flag.NewFlagSet("up", flag.ExitOnError)
+	cp := cfgPath(fs)
+	daemon := fs.Bool("d", false, "detach")
+	_ = fs.Parse(args)
+	cfg := loadPMC(*cp)
+	if cfg.Device == "" || cfg.Token == "" {
+		return fmt.Errorf("not paired — pmc pair <code> first")
+	}
+	if *daemon {
+		// Advisory pre-check so a duplicate `up -d` fails HERE with a
+		// clear error instead of spawning a child that immediately
+		// refuses in the log file. (The child re-checks under its own
+		// lock — this is just UX, the lock is the arbiter.)
+		if p := pid.Read(pidPath(cfg)); pid.Live(p, "pmc") && pid.Busy(pidPath(cfg)) {
+			return fmt.Errorf("daemon already running (pid %d) — pmc down first", p)
+		}
+		bin, err := os.Executable()
+		if err != nil {
+			return err
+		}
+		// Detached daemons log to a file, never to the void: a silent
+		// daemon is undiagnosable (this exact trap cost real debugging).
+		logPath := filepath.Join(cfg.DataDir, "pmc.log")
+		cmd := exec.Command(bin, "up", "--config", *cp)
+		cmd.Env = os.Environ()
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+		cmd.Stdin = nil
+		// Open here so a bad data dir fails loudly in the parent.
+		lf, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+		if err != nil {
+			return fmt.Errorf("daemon log %s: %w", logPath, err)
+		}
+		defer lf.Close()
+		cmd.Stdout, cmd.Stderr = lf, lf
+		if err := cmd.Start(); err != nil {
+			return err
+		}
+		fmt.Printf("daemon starting (log %s; verify with: pmc status)\n", logPath)
+		return nil
+	}
+	// Foreground daemon (and the detached child above): singleton via file
+	// lock, not pid existence. The lock dies with the process, so crashes
+	// can't wedge startup — and a parent-written pid can never read as
+	// "already running" to its own child.
+	lock, err := pid.Acquire(pidPath(cfg), os.Getpid(), "pmc")
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	runDaemon(*cp)
+	return nil
+}
+
+func cmdDown(args []string) error {
+	args = hoist(args, "config")
+	fs := flag.NewFlagSet("down", flag.ExitOnError)
+	cp := cfgPath(fs)
+	_ = fs.Parse(args)
+	cfg := loadPMC(*cp)
+	p := pid.Read(pidPath(cfg))
+	if !pid.Live(p, "pmc") {
+		fmt.Println("daemon not running")
+		return nil
+	}
+	if proc, err := os.FindProcess(p); err == nil {
+		_ = proc.Signal(syscall.SIGTERM)
+	}
+	markOffline(*cp)
+	fmt.Println("daemon stopped")
+	return nil
+}
+
+// --- daemon ---
+
+func runDaemon(cfgPath string) {
+	cfg := loadPMC(cfgPath)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+
+	id, err := keys.LoadOrCreate(cfg.DataDir, derpHostOf(cfg))
+	if err != nil {
+		log.Printf("pmc: keys: %v", err)
+		return
+	}
+	tun := bridge.New(log.Printf)
+	if ck, err := id.ClientKey(); err == nil {
+		tun.WithClientKey(ck)
+	}
+	// Our relay map, never the public default (a foreign home relay cannot
+	// reach peers homed on ours — dials would hang with a live relay).
+	tun.WithDERPMapURL(apiBase(cfg) + "/_pms/derpmap.json")
+	defer tun.Close()
+
+	var srv *tailcat.Server
+	restartServing := func(allow []string) {
+		if srv != nil {
+			srv.Close()
+			srv = nil
+		}
+		// Reload identity every restart (not just at boot): the node key
+		// is stable but the region follows cfg.Server, so a domain move
+		// converges on SIGHUP instead of stranding the server on a dead
+		// DERP hostname (observed live: TLS errors to nowhere).
+		nid, err := keys.LoadOrCreate(cfg.DataDir, derpHostOf(cfg))
+		if err != nil {
+			log.Printf("pmc: keys: %v", err)
+			return
+		}
+		id = nid
+		s, err := id.Server(log.Printf)
+		if err != nil {
+			log.Printf("pmc: server build: %v", err)
+			return
+		}
+		s.DERPMapURL = apiBase(cfg) + "/_pms/derpmap.json"
+		tcp := map[uint16]string{}
+		for _, e := range cfg.Exposes {
+			if e.UDP != 0 {
+				continue // udp-only entries serve no TCP (least privilege)
+			}
+			tcp[uint16(e.Local)] = fmt.Sprintf("127.0.0.1:%d", e.Local)
+		}
+		if cfg.ServeSSH {
+			tcp[22] = "127.0.0.1:22"
+		}
+		udp := map[uint16]string{}
+		for _, e := range cfg.Exposes {
+			if e.UDP != 0 {
+				udp[uint16(e.Local)] = fmt.Sprintf("127.0.0.1:%d", e.Local)
+			}
+		}
+		addr := ""
+		if err := bridge.Serve(s, bridge.ServeConfig{TCP: tcp, UDP: udp, Allow: allow}); err != nil {
+			log.Printf("pmc: serve: %v (heartbeat continues; tunnel comes up when DERP is reachable)", err)
+		} else {
+			srv = s
+			addr = string(s.TailcatAddr())
+		}
+		heartbeat(cfg, addr)
+		if srv != nil {
+			log.Printf("pmc: serving as %q (allow %d peers)", cfg.Device, len(allow))
+		}
+	}
+
+	// Allowlist with disk cache: a failed fetch keeps serving the last-known
+	// set instead of failing closed to deny-all on a network blip.
+	allow, _ := fetchAllowlist(cfg)
+	allow = cachedAllow(cfg, allow)
+	restartServing(allow)
+	hb := time.NewTicker(30 * time.Second)
+	allowTick := time.NewTicker(30 * time.Second)
+	defer hb.Stop()
+	defer allowTick.Stop()
+	lastSig := serveSignature(allow, cfg)
+	for {
+		select {
+		case <-ctx.Done():
+			markOffline(cfgPath)
+			if srv != nil {
+				srv.Close()
+			}
+			return
+		case <-hup:
+			cfg = loadPMC(cfgPath)
+			allow, _ := fetchAllowlist(cfg)
+			allow = cachedAllow(cfg, allow)
+			lastSig = serveSignature(allow, cfg)
+			restartServing(allow)
+		case <-hb.C:
+			cfg = loadPMC(cfgPath)
+			addr := ""
+			if srv != nil {
+				addr = string(srv.TailcatAddr())
+			}
+			heartbeat(cfg, addr)
+		case <-allowTick.C:
+			cfg = loadPMC(cfgPath)
+			// Restart serving only when membership/exposes actually
+			// changed — restarts flap the tailcat server otherwise.
+			fresh, err := fetchAllowlist(cfg)
+			if err != nil {
+				continue // keep serving cached set; retry next tick
+			}
+			fresh = cachedAllow(cfg, fresh)
+			if sig := serveSignature(fresh, cfg); sig != lastSig {
+				lastSig = sig
+				allow = fresh
+				restartServing(allow)
+			}
+		}
+	}
+}
+
+// serveSignature covers everything restartServing consumes, so the allow
+// ticker can skip no-op restarts.
+func serveSignature(allow []string, cfg config.PMCConfig) string {
+	return fmt.Sprintf("allow=%s exposes=%v ssh=%v",
+		strings.Join(allow, ","), exposeSpecs(cfg), cfg.ServeSSH)
+}
+
+// cachedAllow persists the last good allowlist; nil fetch results reuse it.
+// The server is the source of truth — the cache only bridges outages.
+func cachedAllow(cfg config.PMCConfig, fresh []string) []string {
+	path := filepath.Join(cfg.DataDir, "allowlist.json")
+	if fresh != nil {
+		if b, err := json.Marshal(fresh); err == nil {
+			_ = os.WriteFile(path, b, 0o600)
+		}
+		return fresh
+	}
+	var cached []string
+	if b, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(b, &cached)
+	}
+	return cached
+}
+
+// --- server API helpers ---
+
+func apiBase(cfg config.PMCConfig) string { return strings.TrimSuffix(cfg.Server, "/") }
+
+func directoryFetch(cfg config.PMCConfig) (devs []struct {
+	Name     string    `json:"name"`
+	Online   bool      `json:"online"`
+	LastSeen time.Time `json:"last_seen"`
+}, rev uint64, err error) {
+	req, _ := http.NewRequest("GET", apiBase(cfg)+"/_pms/directory", nil)
+	req.Header.Set("X-Device", cfg.Device)
+	req.Header.Set("Authorization", "Bearer "+cfg.Token)
+	resp, err := apiClient.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, 0, fmt.Errorf("directory: server refused (re-pair?)")
+	}
+	var out struct {
+		Revision uint64 `json:"revision"`
+		Devices  []struct {
+			Name     string    `json:"name"`
+			Online   bool      `json:"online"`
+			LastSeen time.Time `json:"last_seen"`
+		} `json:"devices"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, 0, err
+	}
+	return out.Devices, out.Revision, nil
+}
+
+type peerInfo struct {
+	Name     string
+	PubKey   string
+	FullAddr string
+}
+
+func directoryLookup(cfg config.PMCConfig, name string) (peerInfo, error) {
+	req, _ := http.NewRequest("GET", apiBase(cfg)+"/_pms/directory", nil)
+	req.Header.Set("X-Device", cfg.Device)
+	req.Header.Set("Authorization", "Bearer "+cfg.Token)
+	resp, err := apiClient.Do(req)
+	if err != nil {
+		return peerInfo{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return peerInfo{}, fmt.Errorf("directory: server refused (re-pair?)")
+	}
+	var out struct {
+		Devices []struct {
+			Name     string `json:"name"`
+			PubKey   string `json:"pubkey"`
+			FullAddr string `json:"full_addr"`
+		} `json:"devices"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return peerInfo{}, err
+	}
+	for _, d := range out.Devices {
+		if d.Name == name {
+			if d.FullAddr == "" {
+				return peerInfo{}, fmt.Errorf("%q is offline (no address)", name)
+			}
+			return peerInfo{Name: d.Name, PubKey: d.PubKey, FullAddr: d.FullAddr}, nil
+		}
+	}
+	return peerInfo{}, fmt.Errorf("no such device %q (pmc devices)", name)
+}
+
+// trustCheck implements TOFU: pin peer pubkey on first use, warn on change.
+func trustCheck(cfg config.PMCConfig, p peerInfo) error {
+	path := filepath.Join(cfg.DataDir, "known_peers")
+	known := map[string]string{}
+	if b, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(b, &known)
+	}
+	if prev, ok := known[p.Name]; ok {
+		if prev != p.PubKey {
+			return fmt.Errorf("SECURITY: %q identity changed (possible impersonation) — confirm out-of-band, then delete %s", p.Name, path)
+		}
+		return nil
+	}
+	known[p.Name] = p.PubKey
+	b, _ := json.Marshal(known)
+	_ = os.WriteFile(path, b, 0o600)
+	// Fail closed on EOF/pipes: only an explicit TTY answer trusts.
+	// (fmt.Scanln would accept on EOF since ans stays "".)
+	fmt.Printf("trust %q [%s]? [Y/n] ", p.Name, shortKey(p.PubKey))
+	br := bufio.NewReader(os.Stdin)
+	line, err := br.ReadString('\n')
+	if err != nil {
+		delete(known, p.Name)
+		b, _ := json.Marshal(known)
+		_ = os.WriteFile(path, b, 0o600)
+		return fmt.Errorf("aborted (no confirmation)")
+	}
+	ans := strings.ToLower(strings.TrimSpace(line))
+	if ans != "" && ans != "y" && ans != "yes" {
+		delete(known, p.Name)
+		b, _ := json.Marshal(known)
+		_ = os.WriteFile(path, b, 0o600)
+		return fmt.Errorf("aborted")
+	}
+	return nil
+}
+
+func shortKey(k string) string {
+	if len(k) > 19 {
+		return k[:19] + "…"
+	}
+	return k
+}
+
+// apiClient bounds every control-plane call. A blackholed server must fail
+// fast (pairing, directory, heartbeat) — never hang a CLI or the daemon.
+var apiClient = &http.Client{Timeout: 15 * time.Second}
+
+func fetchAllowlist(cfg config.PMCConfig) ([]string, error) {
+	req, _ := http.NewRequest("GET", apiBase(cfg)+"/_pms/directory", nil)
+	req.Header.Set("X-Device", cfg.Device)
+	req.Header.Set("Authorization", "Bearer "+cfg.Token)
+	resp, err := apiClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("directory: server refused (re-pair?)")
+	}
+	var out struct {
+		Devices []struct {
+			PubKey string `json:"pubkey"`
+		} `json:"devices"`
+		ServerPubKey string `json:"server_pubkey"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	var allow []string
+	for _, d := range out.Devices {
+		allow = append(allow, d.PubKey)
+	}
+	// The server's bridge dials us for public traffic — without its key
+	// in our allowlist every public byte 502s while P2P keeps working.
+	if out.ServerPubKey != "" {
+		allow = append(allow, out.ServerPubKey)
+	}
+	return allow, nil
+}
+
+func heartbeat(cfg config.PMCConfig, fullAddr string) {
+	postPresence(cfg, fullAddr, true)
+}
+
+// markOffline tells the directory this device is going away (best effort;
+// the server also ages presence via LastSeen).
+func markOffline(path string) {
+	cfg := loadPMC(path)
+	if cfg.Device == "" || cfg.Token == "" {
+		return
+	}
+	postPresence(cfg, "", false)
+}
+
+func postPresence(cfg config.PMCConfig, fullAddr string, online bool) {
+	specs := exposeSpecs(cfg)
+	body, _ := json.Marshal(map[string]any{
+		"full_addr": fullAddr, "exposes": specs, "online": online,
+	})
+	req, _ := http.NewRequest("POST", apiBase(cfg)+"/_pms/heartbeat", bytes.NewReader(body))
+	req.Header.Set("X-Device", cfg.Device)
+	req.Header.Set("Authorization", "Bearer "+cfg.Token)
+	if resp, err := apiClient.Do(req); err == nil {
+		resp.Body.Close()
+	}
+}
+
+func exposeSpecs(cfg config.PMCConfig) []string {
+	out := []string{} // non-nil: explicit empty clears server-side exposes
+	for _, e := range cfg.Exposes {
+		switch {
+		case e.As != "":
+			out = append(out, fmt.Sprintf("web:%s:%d", e.As, e.Local))
+		case e.Host != "":
+			out = append(out, fmt.Sprintf("webhost:%s:%d", e.Host, e.Local))
+		case e.TCP != 0:
+			out = append(out, fmt.Sprintf("tcp:%d:%d", e.TCP, e.Local))
+		case e.UDP != 0:
+			out = append(out, fmt.Sprintf("udp:%d:%d", e.UDP, e.Local))
+		}
+	}
+	if cfg.ServeSSH {
+		out = append(out, "ssh")
+	}
+	return out
+}
+
+func clientKey(cfg config.PMCConfig) (key.NodePrivate, error) {
+	id, err := keys.LoadOrCreate(cfg.DataDir, derpHostOf(cfg))
+	if err != nil {
+		return key.NodePrivate{}, err
+	}
+	return id.ClientKey()
+}
+
+// guessDerpHost derives the DERP host from a pairing URL without pairing:
+// https://pair.example.com → derp.example.com (dev IP URLs pass through).
+// Proper URL parsing (brackets, ports, userinfo) beats string surgery.
+func guessDerpHost(serverURL string) string {
+	if u, err := url.Parse(serverURL); err == nil && u.Hostname() != "" {
+		if hn, ok := strings.CutPrefix(u.Hostname(), "pair."); ok {
+			return "derp." + hn
+		}
+		return u.Hostname()
+	}
+	// Unparseable input: best-effort fallback so the failure surfaces as a
+	// dial error, not a panic or empty region.
+	u := strings.TrimPrefix(strings.TrimPrefix(serverURL, "https://"), "http://")
+	if h, _, err := net.SplitHostPort(u); err == nil {
+		u = h
+	}
+	return u
+}
+
+func derpHostOf(cfg config.PMCConfig) string { return guessDerpHost(cfg.Server) }
