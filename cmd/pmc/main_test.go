@@ -101,3 +101,21 @@ func TestSSHLoginParsing(t *testing.T) {
 		}
 	}
 }
+
+func TestParseForwardTarget(t *testing.T) {
+	name, port, err := parseForwardTarget("office:22")
+	if err != nil || name != "office" || port != 22 {
+		t.Fatalf("got %q %d %v", name, port, err)
+	}
+	if _, _, err := parseForwardTarget("office"); err == nil {
+		t.Fatal("missing port accepted")
+	}
+	if _, _, err := parseForwardTarget(":22"); err == nil {
+		t.Fatal("missing name accepted")
+	}
+	for _, bad := range []string{"office:0", "office:99999", "office:abc", "office:-1"} {
+		if _, _, err := parseForwardTarget(bad); err == nil {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+}

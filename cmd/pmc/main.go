@@ -87,6 +87,8 @@ func main() {
 		err = cmdUnserve(args)
 	case "ssh":
 		err = cmdSSH(args)
+	case "forward":
+		err = cmdForward(args)
 	case "devices":
 		err = cmdDevices(args)
 	case "list":
@@ -128,6 +130,7 @@ func usage() {
   pmc serve ssh               serve this box's sshd to paired devices
   pmc unserve ssh             stop serving sshd
   pmc ssh [user@]<name> [-- cmd]  SSH into a paired device (names, not tokens)
+  pmc forward <name>:<port> [local]  localhost forward for plain-TCP tools
   pmc devices                 paired devices + presence
   pmc list                    this device's exposes
   pmc status                  tunnel + daemon health
@@ -458,47 +461,17 @@ func cmdSSH(args []string) error {
 	if err := trustCheck(cfg, peer); err != nil {
 		return err
 	}
+	dialer, err := newPeerDialer(cfg, peer)
+	if err != nil {
+		return err
+	}
+	defer dialer.close()
 	// Local forward → peer:22, then stock ssh with per-name host alias.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return err
 	}
 	defer ln.Close()
-	tun := bridge.New(nil)
-	ck, err := clientKey(cfg)
-	if err != nil {
-		return err
-	}
-	tun.WithClientKey(ck)
-	tun.WithDERPMapURL(apiBase(cfg) + "/_pms/derpmap.json")
-	defer tun.Close()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	// Stale addresses (peer re-paired, daemon restarted) refresh once per
-	// connection instead of failing the whole session.
-	var pmu sync.Mutex
-	cur := peer
-	refresh := func() {
-		if p, err := directoryLookup(cfg, name); err == nil && p.FullAddr != "" {
-			pmu.Lock()
-			cur = p
-			pmu.Unlock()
-		}
-	}
-	dialPeer := func() (net.Conn, error) {
-		pmu.Lock()
-		addr := cur.FullAddr
-		pmu.Unlock()
-		up, err := tun.DialTCP(ctx, tailcat.Addr(addr), 22)
-		if err == nil {
-			return up, nil
-		}
-		refresh()
-		pmu.Lock()
-		addr = cur.FullAddr
-		pmu.Unlock()
-		return tun.DialTCP(ctx, tailcat.Addr(addr), 22)
-	}
 	go func() {
 		for {
 			down, err := ln.Accept()
@@ -507,7 +480,7 @@ func cmdSSH(args []string) error {
 			}
 			go func(down net.Conn) {
 				defer down.Close()
-				up, err := dialPeer()
+				up, err := dialer.dial(22)
 				if err != nil {
 					return
 				}
@@ -536,6 +509,152 @@ func sshTarget(login string) string {
 		return "127.0.0.1"
 	}
 	return login + "@127.0.0.1"
+}
+
+// peerDialer dials one peer's TCP ports through the mesh: directory lookup
+// once, TOFU check once, then per-connection dials with one refresh-and-
+// retry on stale addresses (peer re-paired, daemon restarted).
+type peerDialer struct {
+	tun  *bridge.Tunnel
+	ctx  context.Context
+	cfg  config.PMCConfig
+	name string
+	mu   sync.Mutex
+	cur  peerInfo
+}
+
+func newPeerDialer(cfg config.PMCConfig, peer peerInfo) (*peerDialer, error) {
+	tun := bridge.New(nil)
+	ck, err := clientKey(cfg)
+	if err != nil {
+		return nil, err
+	}
+	tun.WithClientKey(ck)
+	tun.WithDERPMapURL(apiBase(cfg) + "/_pms/derpmap.json")
+	return &peerDialer{
+		tun: tun,
+		ctx: context.Background(),
+		cfg: cfg, name: peer.Name, cur: peer,
+	}, nil
+}
+
+func (d *peerDialer) close() {
+	d.tun.Close()
+}
+
+func (d *peerDialer) refresh() {
+	if p, err := directoryLookup(d.cfg, d.name); err == nil && p.FullAddr != "" {
+		d.mu.Lock()
+		d.cur = p
+		d.mu.Unlock()
+	}
+}
+
+func (d *peerDialer) dial(port uint16) (net.Conn, error) {
+	d.mu.Lock()
+	addr := d.cur.FullAddr
+	d.mu.Unlock()
+	ctx, cancel := context.WithTimeout(d.ctx, bridge.DialTimeout)
+	defer cancel()
+	if up, err := d.tun.DialTCP(ctx, tailcat.Addr(addr), port); err == nil {
+		return up, nil
+	}
+	d.refresh()
+	d.mu.Lock()
+	addr = d.cur.FullAddr
+	d.mu.Unlock()
+	ctx2, cancel2 := context.WithTimeout(d.ctx, bridge.DialTimeout)
+	defer cancel2()
+	return d.tun.DialTCP(ctx2, tailcat.Addr(addr), port)
+}
+
+// parseForwardTarget splits "<name>:<port>" (device names never contain
+// colons, so the last one separates).
+func parseForwardTarget(s string) (name string, port uint16, err error) {
+	i := strings.LastIndex(s, ":")
+	if i < 0 {
+		return "", 0, fmt.Errorf("want <name>:<port>, got %q", s)
+	}
+	n, perr := strconv.Atoi(s[i+1:])
+	if perr != nil || n <= 0 || n > 65535 {
+		return "", 0, fmt.Errorf("bad port in %q", s)
+	}
+	if s[:i] == "" {
+		return "", 0, fmt.Errorf("want <name>:<port>, got %q", s)
+	}
+	return s[:i], uint16(n), nil
+}
+
+// cmdForward exposes a peer's TCP port on local loopback for tools that
+// speak plain SSH/TCP but not the mesh: VS Code Remote, Ansible, Termius,
+// database GUIs, rsync, scp. Runs until Ctrl-C.
+func cmdForward(args []string) error {
+	args = hoist(args, "config")
+	fs := flag.NewFlagSet("forward", flag.ExitOnError)
+	cp := cfgPath(fs)
+	_ = fs.Parse(args)
+	if fs.NArg() < 1 || fs.NArg() > 2 {
+		return fmt.Errorf("usage: pmc forward <name>:<port> [local-port]")
+	}
+	name, port, err := parseForwardTarget(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	local := int(port)
+	if fs.NArg() == 2 {
+		local, err = strconv.Atoi(fs.Arg(1))
+		if err != nil || local <= 0 || local > 65535 {
+			return fmt.Errorf("bad local port %q", fs.Arg(1))
+		}
+	}
+	cfg := loadPMC(*cp)
+	if cfg.Device == "" || cfg.Token == "" {
+		return fmt.Errorf("not paired — pmc pair <code> first")
+	}
+	peer, err := directoryLookup(cfg, name)
+	if err != nil {
+		return err
+	}
+	if err := trustCheck(cfg, peer); err != nil {
+		return err
+	}
+	dialer, err := newPeerDialer(cfg, peer)
+	if err != nil {
+		return err
+	}
+	defer dialer.close()
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", local))
+	if err != nil {
+		return fmt.Errorf("forward: listen: %w (something already on %d?)", err, local)
+	}
+	defer ln.Close()
+	fmt.Printf("forwarding 127.0.0.1:%d → %s:%d  (Ctrl-C to stop)\n", local, name, port)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		ln.Close()
+	}()
+	for {
+		down, err := ln.Accept()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+				continue
+			}
+		}
+		go func(down net.Conn) {
+			defer down.Close()
+			up, err := dialer.dial(port)
+			if err != nil {
+				return
+			}
+			defer up.Close()
+			tailcat.ProxyConns(down, up)
+		}(down)
+	}
 }
 
 // validLogin accepts POSIX-ish login names; stock ssh re-validates anyway.

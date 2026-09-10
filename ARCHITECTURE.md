@@ -77,7 +77,8 @@ to whom*. That's the whole product:
   outages); peers TOFU-pin each other and abort — including on EOF —
   at the slightest identity change.
 - **CLI/UX** (`pms`, `pmc`): pairing, exposing (`3000 --as shop`,
-  `--host`, `--tcp`, `--udp`), `serve ssh`, `ssh [user@]name`, daemon
+  `--host`, `--tcp`, `--udp`), `serve ssh`, `ssh [user@]name`,
+  `forward name:port` (localhost endpoint for plain-TCP tools), daemon
   lifecycle with file locks (never pid-existence checks), systemd units,
   installer, health on loopback only.
 
